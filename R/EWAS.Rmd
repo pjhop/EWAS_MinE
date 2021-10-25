@@ -1,0 +1,2164 @@
+---
+title: "EWAS MinE"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+note: the invoked scripts (mlma.R, limma.R etc.) are located in the R/utils/ folder.
+
+## Environment
+
+Directories, variables
+
+```{bash}
+inputdir=""
+inputdirraw=""
+datadir=""
+outdir=""
+logdir=""
+
+# General 
+pheno=caseControl_bin
+levels=0,1
+
+# Per batch 
+prefixes=(ewas_122019_mine_450k ewas_122019_mine_epic ewas_122019_AUS_batch1 ewas_122019_AUS_batch2)
+batches=(mine_450k mine_epic AUS_batch1 AUS_batch2)
+arrays=(450k EPIC 450k 450k)
+
+betas=(
+  "${inputdir}/beta_cleaned_filtered_postqc_mine_450k.rds"
+  "${inputdir}/beta_cleaned_filtered_postqc_mine_epic.rds"
+  "${inputdir}/beta_cleaned_filtered_postqc_AUS_batch1.rds"
+  "${inputdir}/beta_cleaned_filtered_postqc_AUS_batch2.rds")
+
+befiles=(
+  "${inputdir}/beta_cleaned_filtered_postqc_mine_450k"
+  "${inputdir}/beta_cleaned_filtered_postqc_mine_epic"
+  "${inputdir}/beta_cleaned_filtered_postqc_AUS_batch1"
+  "${inputdir}/beta_cleaned_filtered_postqc_AUS_batch2")
+
+samplesheets=("${datadir}/samplesheet_mine_450k.rds" 
+              "${datadir}/samplesheet_mine_epic.rds"
+              "${datadir}/samplesheet_AUS_batch1.rds"
+              "${datadir}/samplesheet_AUS_batch2.rds")
+              
+removeprobes=("${datadir}/remove_probes_missingbatch_mine_450k" 
+              "${datadir}/remove_probes_missingbatch_mine_epic"
+              "${datadir}/remove_probes_missingbatch_AUS_batch1"
+              "${datadir}/remove_probes_missingbatch_AUS_batch2")
+              
+missingnessmatrices=("${datadir}/missingness_matrix_mine_450k.rds" 
+                     "${datadir}/missingness_matrix_mine_epic.rds" 
+                     "${datadir}/missingness_matrix_AUS_batch1.rds" 
+                     "${datadir}/missingness_matrix_AUS_batch2.rds")
+                     
+outs=(${outdir} ${outdir} ${outdir} ${outdir})
+logs=(${logdir} ${logdir} ${logdir} ${logdir})
+
+
+samplesheets_res=("${datadir}/PCs/samplesheet_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs.rds" 
+              "${datadir}/PCs/samplesheet_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs.rds"
+              "${datadir}/PCs/samplesheet_AUS_batch1_PCs_residuals_agesexbatchcellcounts30controlPCs.rds"
+              "${datadir}/PCs/samplesheet_AUS_batch2_PCs_residuals_agesexbatchcellcounts30controlPCs.rds")
+              
+samplesheets_source=(
+"$inputdirraw/merged_450k/input/samplesheet_merged_450k.rds"
+"$inputdirraw/merged_epic/input/samplesheet_merged_epic.rds"
+"$inputdirraw/AUS_batch1/input/samplesheet_AUS_batch1.rds"
+"$inputdirraw/AUS_batch2/input/samplesheet_AUS_batch2.rds")
+
+rgsets=(
+"$inputdirraw/merged_450k/interim/rgset_merged_450k.rds"
+"$inputdirraw/merged_epic/interim/rgset_merged_epic.rds"
+"$inputdirraw/AUS_batch1/interim/rgset_AUS_batch1.rds"
+"$inputdirraw/AUS_batch2/interim/rgset_AUS_batch2.rds")
+
+msets=(
+"$inputdirraw/merged_450k/interim/mset_merged_450k.rds"
+"$inputdirraw/merged_epic/interim/mset_merged_epic.rds"
+"$inputdirraw/AUS_batch1/interim/mset_AUS_batch1.rds"
+"$inputdirraw/AUS_batch2/interim/mset_AUS_batch2.rds")
+
+removesamples_FN=(
+"$inputdirraw/merged_450k/interim/sample_outliers_merged_450k.txt"
+"$inputdirraw/merged_epic/interim/sample_outliers_merged_epic.txt"
+"$inputdirraw/AUS_batch1/interim/sample_outliers_AUS_batch1.txt"
+"$inputdirraw/AUS_batch2/interim/sample_outliers_AUS_batch2.txt")
+```
+
+variables in R:
+
+```{r}
+inputdir <- ""
+datadir <- ""
+outdir <- ""
+logdir <- ""
+cohorts <- c("mine_450k", "mine_epic", "AUS_batch1", "AUS_batch2")
+```
+
+
+## Preprocessing
+
+### Probes missing in entire batches
+
+Probes that are 100% missing in a specific batch will lead to an error in OSCA (when adjusting for batch)
+
+```{r}
+## Libraries
+library(tidyverse)
+library(magrittr)
+library(Matrix)
+
+tib <- tibble(
+  Study =  cohorts,
+  missingness_matrix = sprintf(c("%s/missingness_matrix_%s.rds"
+  ), datadir, cohorts),
+  data = sprintf("%s", datadir)
+)
+
+## Check if there are probes with missingness in 1 batch
+samplesheet_merged <- readRDS("../data/samplesheet_merged.rds")
+
+get_mean_missingness_perbatch <- function(batch, samplesheet, missingness) {
+  print(batch)
+  samplesheet_ <- samplesheet %>% dplyr::filter(Batch == batch)
+  missingness_ <- missingness[,samplesheet_$Sample_Name]
+  prop_missing <- rowMeans(missingness_)
+  prop_missing <- prop_missing[prop_missing == 1]
+  if(length(prop_missing) > 0) {
+    return(names(prop_missing))
+  } else {
+    return(NA)
+  }
+}
+
+get_probes <- function(batch, samplesheet, tib) {
+  library(Matrix)
+  missingness_mat <- readRDS((tib %>% filter(Study == batch) %$% missingness_matrix))
+  opi <- readr::read_tsv(sprintf("%s/beta_cleaned_filtered_postqc_%s.opi", inputdir,batch), col_names=FALSE)
+  missingness_mat <- missingness_mat[rownames(missingness_mat) %in% opi$X2,]
+  samplesheet_tmp <- samplesheet %>% filter(Study == batch)
+  missingness_mat <- missingness_mat[,samplesheet_tmp$Sample_Name]
+  probes <- unlist(purrr::map(unique(samplesheet_tmp$Batch), .f = get_mean_missingness_perbatch, 
+                              samplesheet = samplesheet_tmp, missingness = missingness_mat))
+  probes <- unique(probes[!is.na(probes)])
+  probes
+}
+
+probes <- purrr::map(tib$Study, .f = get_probes, samplesheet = samplesheet_merged, tib = tib)
+names(probes) <- tib$Study
+
+for(batch in unique(tib$Study)) {
+  remove_probes <- probes[[batch]]
+  dat <- tib %>% dplyr::filter(Study == batch) %$% data
+  readr::write_lines(remove_probes, path = sprintf("%s/remove_probes_missingbatch_%s", dat, batch))
+}
+```
+
+
+### Get residual PCs (age, sex, batch, cellcounts, 30 control PCs)
+
+PCs are calculated by regressing the β-values on the covariates used in the linear model, followed by performing principal component analysis on the residuals from this regression.
+
+#### get_residuals_agesexbatchcellcounts30controlPCs.R script 
+
+```{r}
+## Libraries 
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(optparse)
+library(dplyr)
+library(magrittr)
+
+## Options
+option_list <- list(
+  make_option(c("-b", "--beta"), action="store", type = "character", default=NULL,
+              help="Path to beta matrix (RDS file)"),
+  make_option(c("-s", "--samplesheet"), action="store", type = "character", default=NULL,
+              help="samplesheet (rds-file)"),
+  make_option(c("-t", "--batch"), action="store", type = "character", default=NULL,
+              help="name of batch"),
+  make_option(c("-o", "--out"), action="store", type = "character", default=NULL,
+              help="filename to write residuals to (rds-file)")
+)
+
+opt_parser = OptionParser(option_list=option_list)
+opt = parse_args(opt_parser)
+
+## Load data
+beta <- readRDS(opt$beta)
+samplesheet <- readRDS(opt$samplesheet)
+
+## Remove xy-probes beforehand 
+anno_450k <- data.frame(getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+xy_450k <- anno_450k %>% dplyr::filter(chr %in% c("chrX", "chrY")) %$% Name
+anno_EPIC <- data.frame(getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+xy_EPIC <- anno_EPIC %>% dplyr::filter(chr %in% c("chrX", "chrY")) %$% Name
+xy <- unique(c(xy_450k, xy_EPIC))
+rm(anno_450k, anno_EPIC); gc()
+beta <- beta[!rownames(beta) %in% xy,, drop = FALSE]
+
+## Mean imputation
+beta <- beta[,samplesheet$Sample_Name,drop=FALSE]
+
+### In chunks if matrix is large (EPIC)
+if(nrow(beta) > 500000) {
+  is <- seq(1, nrow(beta), by = 1e5)
+  for(i in 1:length(is)) {
+    print(i)
+    if(i == 1) {
+      from = is[i]
+      to = is[i+1]-1
+      beta_new <- beta[from:to,]
+      k <- which(is.na(beta_new), arr.ind=TRUE)
+      beta_new[k] <- rowMeans(beta_new, na.rm=TRUE)[k[,1]]
+    } else if(i != length(is)) {
+      from = is[i]
+      to = is[i+1]-1
+      mat <- beta[from:to,]
+      k <- which(is.na(mat), arr.ind=TRUE)
+      mat[k] <- rowMeans(mat, na.rm=TRUE)[k[,1]]
+      beta_new <- rbind(beta_new, mat)
+    } else {
+      from = is[i]
+      to = nrow(beta)
+      mat <- beta[from:to,]
+      k <- which(is.na(mat), arr.ind=TRUE)
+      mat[k] <- rowMeans(mat, na.rm=TRUE)[k[,1]]
+      beta_new <- rbind(beta_new, mat)
+    }
+  }
+  beta <- beta_new
+  rm(beta_new); gc()
+  
+} else {
+  k <- which(is.na(beta), arr.ind=TRUE)
+  beta[k] <- rowMeans(beta, na.rm=TRUE)[k[,1]]
+}
+
+# Get residuals 
+get_residuals <- function(beta, samplesheet, batch) {
+  if(batch %in% c("mine_450k", "mine_epic")) {
+    lem <- lm(t(beta[,samplesheet$Sample_Name]) ~ CD4T + CD8T + Mono + Gran + NK + Batch + Sex + Predicted_Age_Zhang_EN + PC1_control + PC2_control + PC3_control + PC4_control + PC5_control + PC6_control + PC7_control + PC8_control + PC9_control + PC10_control + 
+                PC11_control + PC12_control + PC13_control + PC14_control + PC15_control + PC16_control + PC17_control + PC18_control + PC19_control + PC20_control + PC21_control + PC22_control + PC23_control + PC24_control + PC25_control + PC26_control + 
+                PC27_control + PC28_control + PC29_control + PC30_control, data = samplesheet)
+  } else {
+    lem <- lm(t(beta[,samplesheet$Sample_Name]) ~ CD4T + CD8T + Mono + Gran + NK + Sex + Predicted_Age_Zhang_EN + PC1_control + PC2_control + PC3_control + PC4_control + PC5_control + PC6_control + PC7_control + PC8_control + PC9_control + PC10_control + 
+                PC11_control + PC12_control + PC13_control + PC14_control + PC15_control + PC16_control + PC17_control + PC18_control + PC19_control + PC20_control + PC21_control + PC22_control + PC23_control + PC24_control + PC25_control + PC26_control + 
+                PC27_control + PC28_control + PC29_control + PC30_control, data = samplesheet, na.action=na.exclude)
+  }
+  residuals <- t(lem$res)
+  residuals 
+}
+
+residuals <- get_residuals(beta = beta, samplesheet = samplesheet, batch = opt$batch)
+
+saveRDS(residuals, file = opt$out)
+```
+
+#### get residuals
+
+```{bash}
+mems=(80G 100G 60G 20G)
+times=('06:00:00' '06:00:00' '04:00:00' '02:00:00')
+folder=PCs
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript get_residuals_agesexbatchcellcounts30controlPCs.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--batch ${batches[$i]} \
+--out ../data/PCs/beta_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs.rds
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name beta_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs \
+-e ../logs/PCs/beta_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs.e \
+-o ../logs/PCs/beta_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs.o 
+done
+```
+
+#### create binary files (OSCA)
+
+```{bash}
+residuals=(
+  "../data/PCs/beta_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs.rds"
+  "../data/PCs/beta_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs.rds"
+  "../data/PCs/beta_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs.rds"
+  "../data/PCs/beta_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs.rds")
+
+folder=PCs
+mems=(80G 80G 50G 30G)
+times=('02:00:00' '02:00:00' '02:00:00' '00:45:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${residuals[$i]} \
+--type other \
+--sex sep \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_residuals_agesexbatchcellcounts30controlPCs.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${residuals[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_residuals_agesexbatchcellcounts30controlPCs \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_residuals_agesexbatchcellcounts30controlPCs.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_residuals_agesexbatchcellcounts30controlPCs.o 
+done
+```
+
+#### perform PCA (OSCA)
+
+```{bash}
+befiles_residuals=(
+  "../data/PCs/beta_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/beta_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/beta_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/beta_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs")
+
+orms_residuals=(
+  "../data/PCs/orm_beta_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/orm_beta_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/orm_beta_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/orm_beta_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs")
+
+pca_residuals=(
+  "../data/PCs/pca_beta_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/pca_beta_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/pca_beta_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs"
+  "../data/PCs/pca_beta_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs")
+
+folder=PCs
+mems=(60G 80G 40G 20G)
+times=('03:30:00' '03:30:00' '01:30:00' '01:30:00')
+
+for i in 0 1 2 3 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript make_orm.R \
+--befile ${befiles_residuals[$i]} \
+--orm ${orms_residuals[$i]} \
+--pca ${pca_residuals[$i]} \
+--removeprobes ${removeprobes[$i]} \
+--npcs 100
+" | sbatch --mem ${mems[$i]} --time ${times[$i]} \
+--job-name orm_residuals_agesexbatchcellcounts30controlPCs_${batches[$i]} \
+-e ${logs[$i]}/${folder}/orm_residuals_agesexbatchcellcounts30controlPCs_${batches[$i]}.e \
+-o ${logs[$i]}/${folder}/orm_residuals_agesexbatchcellcounts30controlPCs_${batches[$i]}.o 
+done
+```
+
+#### add residual PCs to samplesheet 
+
+```{r}
+## Add residual PCs to samplesheets
+library(tidyverse)
+samplesheet <- readRDS("../data/samplesheet_merged.rds")
+
+getPCA <- function(batch) {
+  
+  ## PCA
+  pca <- readr::read_table2(sprintf("%s/PCs/pca_beta_cleaned_filtered_postqc_%s_residuals_agesexbatchcellcounts30controlPCs.eigenvec",datadir, batch), col_names=FALSE)
+  samples <- pca$X1
+  pca$X1 <- pca$X2 <- NULL
+  colnames(pca) <- paste0("PC", 1:ncol(pca), "_res")
+  pca$Sample_Name <- samples
+  pca
+}
+
+pca <- purrr::map_df(unique(samplesheet$Study), .f = getPCA)
+
+samplesheet[,paste0("PC", 1:50)] <- NULL
+samplesheet <- samplesheet %>%
+  dplyr::left_join(
+    pca, by = "Sample_Name"
+  ) 
+
+## Save samplesheet
+saveRDS(samplesheet, file = "../data/PCs/samplesheet_merged_PCs_residuals_agesexbatchcellcounts30controlPCs.rds")
+for(study in unique(samplesheet$Study)) {
+  saveRDS(samplesheet %>% filter(Study == study), 
+          file = sprintf("../data/PCs/samplesheet_%s_PCs_residuals_agesexbatchcellcounts30controlPCs.rds", study))
+}
+```
+
+### Get residual PCs (sex, batch, cellcounts, 30 control PCs)
+
+PCs are calculated by regressing the β-values on the covariates used in the linear model, followed by performing principal component analysis on the residuals from this regression. Here, predicted age is not regressed on, these PCs are used for the age acceleration analyses.
+
+#### get_residuals_sexbatchcellcounts30controlPCs.R script
+
+```{r}
+## Libraries 
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(optparse)
+library(dplyr)
+library(magrittr)
+
+## Options
+option_list <- list(
+  make_option(c("-b", "--beta"), action="store", type = "character", default=NULL,
+              help="Path to beta matrix (RDS file)"),
+  make_option(c("-s", "--samplesheet"), action="store", type = "character", default=NULL,
+              help="samplesheet (rds-file)"),
+  make_option(c("-t", "--batch"), action="store", type = "character", default=NULL,
+              help="name of batch"),
+  make_option(c("-o", "--out"), action="store", type = "character", default=NULL,
+              help="filename to write residuals to (rds-file)")
+)
+
+opt_parser = OptionParser(option_list=option_list)
+opt = parse_args(opt_parser)
+
+## Load data
+beta <- readRDS(opt$beta)
+samplesheet <- readRDS(opt$samplesheet)
+
+## Remove xy-probes beforehand 
+anno_450k <- data.frame(getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+xy_450k <- anno_450k %>% dplyr::filter(chr %in% c("chrX", "chrY")) %$% Name
+anno_EPIC <- data.frame(getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+xy_EPIC <- anno_EPIC %>% dplyr::filter(chr %in% c("chrX", "chrY")) %$% Name
+xy <- unique(c(xy_450k, xy_EPIC))
+rm(anno_450k, anno_EPIC); gc()
+beta <- beta[!rownames(beta) %in% xy,, drop = FALSE]
+
+## Mean imputation
+beta <- beta[,samplesheet$Sample_Name,drop=FALSE]
+
+### In chunks if matrix is large (EPIC)
+if(nrow(beta) > 500000) {
+  is <- seq(1, nrow(beta), by = 1e5)
+  for(i in 1:length(is)) {
+    print(i)
+    if(i == 1) {
+      from = is[i]
+      to = is[i+1]-1
+      beta_new <- beta[from:to,]
+      k <- which(is.na(beta_new), arr.ind=TRUE)
+      beta_new[k] <- rowMeans(beta_new, na.rm=TRUE)[k[,1]]
+    } else if(i != length(is)) {
+      from = is[i]
+      to = is[i+1]-1
+      mat <- beta[from:to,]
+      k <- which(is.na(mat), arr.ind=TRUE)
+      mat[k] <- rowMeans(mat, na.rm=TRUE)[k[,1]]
+      beta_new <- rbind(beta_new, mat)
+    } else {
+      from = is[i]
+      to = nrow(beta)
+      mat <- beta[from:to,]
+      k <- which(is.na(mat), arr.ind=TRUE)
+      mat[k] <- rowMeans(mat, na.rm=TRUE)[k[,1]]
+      beta_new <- rbind(beta_new, mat)
+    }
+  }
+  beta <- beta_new
+  rm(beta_new); gc()
+  
+} else {
+  k <- which(is.na(beta), arr.ind=TRUE)
+  beta[k] <- rowMeans(beta, na.rm=TRUE)[k[,1]]
+}
+
+# Get residuals 
+get_residuals <- function(beta, samplesheet, batch) {
+  if(batch %in% c("mine_450k", "mine_epic")) {
+    lem <- lm(t(beta[,samplesheet$Sample_Name]) ~ CD4T + CD8T + Mono + Gran + NK + Batch + Sex + PC1_control + PC2_control + PC3_control + PC4_control + PC5_control + PC6_control + PC7_control + PC8_control + PC9_control + PC10_control + 
+                PC11_control + PC12_control + PC13_control + PC14_control + PC15_control + PC16_control + PC17_control + PC18_control + PC19_control + PC20_control + PC21_control + PC22_control + PC23_control + PC24_control + PC25_control + PC26_control + 
+                PC27_control + PC28_control + PC29_control + PC30_control, data = samplesheet)
+  } else {
+    lem <- lm(t(beta[,samplesheet$Sample_Name]) ~ CD4T + CD8T + Mono + Gran + NK + Sex + PC1_control + PC2_control + PC3_control + PC4_control + PC5_control + PC6_control + PC7_control + PC8_control + PC9_control + PC10_control + 
+                PC11_control + PC12_control + PC13_control + PC14_control + PC15_control + PC16_control + PC17_control + PC18_control + PC19_control + PC20_control + PC21_control + PC22_control + PC23_control + PC24_control + PC25_control + PC26_control + 
+                PC27_control + PC28_control + PC29_control + PC30_control, data = samplesheet, na.action=na.exclude)
+  }
+  residuals <- t(lem$res)
+  residuals 
+}
+
+residuals <- get_residuals(beta = beta, samplesheet = samplesheet, batch = opt$batch)
+
+saveRDS(residuals, file = opt$out)
+```
+
+#### get residuals
+
+```{bash}
+mems=(80G 100G 60G 20G)
+times=('06:00:00' '06:00:00' '04:00:00' '02:00:00')
+folder=PCs
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript get_residuals_sexbatchcellcounts30controlPCs.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--batch ${batches[$i]} \
+--out ../data/PCs/beta_cleaned_filtered_postqc_${batches[$i]}_residuals_sexbatchcellcounts30controlPCs.rds
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name beta_cleaned_filtered_postqc_${batches[$i]}_residuals_sexbatchcellcounts30controlPCs \
+-e ../logs/PCs/beta_cleaned_filtered_postqc_${batches[$i]}_residuals_sexbatchcellcounts30controlPCs.e \
+-o ../logs/PCs/beta_cleaned_filtered_postqc_${batches[$i]}_residuals_sexbatchcellcounts30controlPCs.o 
+done
+```
+
+
+#### create binary files (OSCA)
+
+```{bash}
+residuals=(
+"../data/PCs/beta_cleaned_filtered_postqc_mine_450k_residuals_sexbatchcellcounts30controlPCs.rds"
+"../data/PCs/beta_cleaned_filtered_postqc_mine_epic_residuals_sexbatchcellcounts30controlPCs.rds"
+"../data/PCs/beta_cleaned_filtered_postqc_AUS_batch1_residuals_sexbatchcellcounts30controlPCs.rds"
+"../data/PCs/beta_cleaned_filtered_postqc_AUS_batch2_residuals_sexbatchcellcounts30controlPCs.rds")
+folder=PCs
+mems=(80G 80G 50G 30G)
+times=('02:00:00' '02:00:00' '02:00:00' '00:45:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${residuals[$i]} \
+--type other \
+--sex sep \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_residuals_sexbatchcellcounts30controlPCs.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${residuals[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_residuals_sexbatchcellcounts30controlPCs \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_residuals_sexbatchcellcounts30controlPCs.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_residuals_sexbatchcellcounts30controlPCs.o 
+done
+```
+
+
+#### calculate PCs (OSCA)
+
+```{bash}
+befiles_residuals=(
+"../data/PCs/beta_cleaned_filtered_postqc_mine_450k_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/beta_cleaned_filtered_postqc_mine_epic_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/beta_cleaned_filtered_postqc_AUS_batch1_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/beta_cleaned_filtered_postqc_AUS_batch2_residuals_sexbatchcellcounts30controlPCs")
+
+orms_residuals=(
+"../data/PCs/orm_beta_cleaned_filtered_postqc_mine_450k_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/orm_beta_cleaned_filtered_postqc_mine_epic_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/orm_beta_cleaned_filtered_postqc_AUS_batch1_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/orm_beta_cleaned_filtered_postqc_AUS_batch2_residuals_sexbatchcellcounts30controlPCs")
+
+pca_residuals=(
+"../data/PCs/pca_beta_cleaned_filtered_postqc_mine_450k_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/pca_beta_cleaned_filtered_postqc_mine_epic_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/pca_beta_cleaned_filtered_postqc_AUS_batch1_residuals_sexbatchcellcounts30controlPCs"
+"../data/PCs/pca_beta_cleaned_filtered_postqc_AUS_batch2_residuals_sexbatchcellcounts30controlPCs")
+folder=PCs
+
+mems=(60G 80G 40G 20G)
+times=('03:30:00' '03:30:00' '01:30:00' '01:30:00')
+for i in 0 1 2 3 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript make_orm.R \
+--befile ${befiles_residuals[$i]} \
+--orm ${orms_residuals[$i]} \
+--pca ${pca_residuals[$i]} \
+--removeprobes ${removeprobes[$i]} \
+--npcs 100
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name orm_residuals_sexbatchcellcounts30controlPC_${batches[$i]} \
+-e ${logs[$i]}/${folder}/orm_residuals_sexbatchcellcounts30controlPC_${batches[$i]}.e \
+-o ${logs[$i]}/${folder}/orm_residuals_sexbatchcellcounts30controlPC_${batches[$i]}.o 
+done
+```
+
+#### add residual PCs to samplesheet
+
+```{r}
+## Add residual PCs to samplesheet
+library(tidyverse)
+samplesheet <- readRDS("../data/samplesheet_merged.rds")
+
+getPCA <- function(batch) {
+  ## PCA
+  pca <- readr::read_table2(sprintf("%s/PCs/pca_beta_cleaned_filtered_postqc_%s_residuals_sexbatchcellcounts30controlPCs.eigenvec", datadir, batch), col_names=FALSE)
+  samples <- pca$X1
+  pca$X1 <- pca$X2 <- NULL
+  colnames(pca) <- paste0("PC", 1:ncol(pca), "_res")
+  pca$Sample_Name <- samples
+  pca
+}
+
+pca <- purrr::map_df(unique(samplesheet$Study), .f = getPCA)
+
+samplesheet[,paste0("PC", 1:50)] <- NULL
+samplesheet <- samplesheet %>%
+  dplyr::left_join(
+    pca, by = "Sample_Name"
+  ) 
+
+## Save samplesheet
+saveRDS(samplesheet, file = "../data/PCs/samplesheet_merged_PCs_residuals_sexbatchcellcounts30controlPCs.rds")
+for(study in unique(samplesheet$Study)) {
+  saveRDS(samplesheet %>% filter(Study == study), 
+          file = sprintf("../data/PCs/samplesheet_%s_PCs_residuals_sexbatchcellcounts30controlPCs.rds", study))
+}
+```
+
+## MOA
+
+case/con MOA
+
+```{bash}
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '06:00:00' '04:00:00')
+name="ewas_moa_covarsexbatch_qcovarage_missing0.05"
+folder=moa
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+## linear model [fine-tuned]
+
+Run linear model with varying number of PCs (0, 5, 10, 15, 20, 25, 30)
+
+```{bash}
+names=(
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs5PCsres_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs10PCsres_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs20PCsres_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+)
+nPCs=(5 10 15 20 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=limma
+
+for ((k=0; k<${#names[@]}; k++ ))
+do
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$k]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$k]}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$k]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$k]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$k]}.o 
+done
+done
+```
+
+No PCs:
+
+```{bash}
+name=(
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_missing0.05"
+)
+nPCs=(5 10 15 20 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=limma
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+## Sensitivity analyses
+
+### Remove case-only batches
+
+Exclude experimental batches that consist of cases-only.
+
+#### MOA 
+
+```{bash}
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '06:00:00' '04:00:00')
+name="ewas_nocaseonly_moa_covarsexbatch_qcovarage_missing0.05"
+folder=sensitivity
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--keepsamples ../data/keep_nocaseonly.txt \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+#### linear model (fine-tuned1.15)
+
+```{bash}
+names=(
+"ewas_nocaseonly_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_nocaseonly_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_nocaseonly_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_nocaseonly_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=sensitivity
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--keepsamples ../data/keep_nocaseonly.txt \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### Functional normalization
+
+Run functional normalization (using the *meffil* package).
+
+#### generate qc objects for each cohort
+
+```{bash}
+outs_qcobjects=("../data/FN/qcobjects_mine_450k.rds" 
+"../data/FN/qcobjects_mine_epic.rds" 
+"../data/FN/qcobjects_AUS_batch1.rds" 
+"../data/FN/cobjects_AUS_batch2.rds")
+              
+times=("12:00:00" "12:00:00" "06:30:00" "05:45:00")
+mems=(40G 40G 20G 20G)
+threads=(6 6 4 2)    
+
+for i in 0 1 2 3 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript get_qc_objects.R \
+--samplesheet ${samplesheets_source[$i]} \
+--cores ${threads[$i]} \
+--out ${outs_qcobjects[$i]} 
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--nodes ${threads[$i]} \
+-e ../logs/FN/get_qc_objects_${batches[$i]}.e \
+-o ../logs/FN/get_qc_objects_${batches[$i]}.o \
+--job-name get_qc_objects_${batches[$i]}
+done
+```
+
+#### run functional normalization
+
+```{bash}
+times=("12:00:00" "12:00:00" "06:30:00" "05:45:00")
+mems=(40G 65G 20G 20G)
+threads=(6 6 4 2)  
+
+out_FN=(
+"../data/FN/beta_FN_rmsampleoutliers_mine_450k.rds"
+"../data/FN/beta_FN_rmsampleoutliers_mine_epic.rds"
+"../data/FN/beta_FN_rmsampleoutliers_AUS_batch1.rds"
+"../data/FN/beta_FN_rmsampleoutliers_AUS_batch2.rds")
+
+for i in 0 1 2 3 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript normalization_FN.R \
+--qcobjects ${outs_qcobjects[$i]} \
+--removesamples ${removesamples_FN[$i]} \
+--variables Array \
+--npcs 5 \
+--cores ${threads[$i]} \
+--out ${out_FN[$i]} 
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+-pe threaded ${threads[$i]} \
+-e ../logs/FN/normalize_FN_${batches[$i]}.e \
+-o ../logs/FN/normalize_FN_${batches[$i]}.o \
+--job-name normalize_FN_${batches[$i]}
+done
+```
+
+#### set failed measurements to NA
+
+```{bash}
+betas_FN=(
+"../data/FN/beta_FN_rmsampleoutliers_mine_450k.rds.beta.rds"
+"../data/FN/beta_FN_rmsampleoutliers_mine_epic.rds.beta.rds"
+"../data/FN/beta_FN_rmsampleoutliers_AUS_batch1.rds.beta.rds"
+"../data/FN/beta_FN_rmsampleoutliers_AUS_batch2.rds.beta.rds")
+
+betas_FN_NA=(
+"../data/FN/beta_FN_rmsampleoutliers_NAs_mine_450k.beta.rds"
+"../data/FN/beta_FN_rmsampleoutliers_NAs_mine_epic.beta.rds"
+"../data/FN/beta_FN_rmsampleoutliers_NAs_AUS_batch1.beta.rds"
+"../data/FN/beta_FN_rmsampleoutliers_NAs_AUS_batch2.beta.rds")
+
+times=("05:00:00" "05:00:00" "03:00:00" "02:00:00")
+mems=("255G" "350G" "200G" "100G")
+
+for i in 0 1 2 3 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript set_failed_measurements_NA.R \
+--rgset ${rgsets[$i]} \
+--beta ${betas_FN[$i]} \
+--detp 1e-16 \
+--beadnr 3 \
+--out ${betas_FN_NA[$i]} 
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+-e ../logs/FN/FN_set_failed_measurements_NA_${batches[$i]}.e \
+-o ../logs/FN/FN_set_failed_measurements_NA_${batches[$i]}.o \
+--job-name FN_set_failed_measurements_NA_${batches[$i]}
+done
+```
+
+
+#### subset
+
+R-function, use same samples and probes as in the main analyses.
+
+```{r}
+# Subset samples + probes 
+
+cat(sprintf("Analysis started at: %s\n\n", Sys.time()))
+
+## Libraries ---------------------------
+library(dplyr)
+library(magrittr)
+library(Matrix)
+
+## Data ---------------------------
+
+studies <- c("mine_450k", "mine_epic", "AUS_batch1", "AUS_batch2")
+betas <- sprintf("../data/FN/beta_FN_rmsampleoutliers_NAs_%s.beta.rds.rds", studies)
+opis <- sprintf("../data/beta_cleaned_filtered_postqc_%s.opi", studies)
+oiis <- sprintf("../data/beta_cleaned_filtered_postqc_%s.oii", studies)
+betas_out <- sprintf("../data/FN/beta_FN_cleaned_filtered_postqc_%s.rds", studies)
+
+names(betas) <- names(opis) <- names(oiis) <- names(betas_out) <- studies
+
+## Functions ---------------------------
+subset <- function(study) {
+  cat(study)
+  oii <- readr::read_tsv(oiis[study], col_names=FALSE)
+  opi <- readr::read_tsv(opis[study], col_names=FALSE)
+  
+  # Read betas
+  beta <- readRDS(betas[study])
+  cat(sprintf("\nDimensions before filtering: nrow=%s, ncol=%s",
+              nrow(beta), ncol(beta)))
+  beta <- beta[as.character(opi$X2), as.character(oii$X1)]
+  cat(sprintf("\nDimensions after filtering: nrow=%s, ncol=%s",
+              nrow(beta), ncol(beta)))
+  
+  saveRDS(beta, file = betas_out[study])
+  NULL
+}
+
+## Run 'remove_probes' function for each study
+purrr::map(studies, .f = subset)
+
+## SessionInfo ---------------------------
+cat(sprintf("Analysis finished at: %s\n\n", Sys.time()))
+cat("SessionInfo:\n\n")
+sessionInfo()
+```
+
+
+```{bash}
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript subset_betas_FN.R
+" | sbatch --time 08:00:00 --mem 100G \
+-e ../logs/FN/subset_betas_FN.e \
+-o ../logs/FN/subset_betas_FN.o \
+--job-name subset_betas_FN
+```
+
+#### create binary files
+
+```{bash}
+betas_FN=(
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_450k.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_epic.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch1.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch2.rds")
+
+mems=(80G 80G 30G 20G)
+times=('01:30:00' '01:30:00' '01:00:00' '00:45:00')
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${betas_FN[$i]} \
+--type beta \
+--sex sep \
+--log ${logs[$i]}/FN/${prefixes[$i]}_create_binary_files_FN.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${betas_FN[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_FN \
+-e ${logs[$i]}/oob/${prefixes[$i]}_create_binary_files_FN.e \
+-o ${logs[$i]}/oob/${prefixes[$i]}_create_binary_files_FN.o 
+done
+```
+
+#### PCA on FN data
+
+##### get residuals
+
+```{bash}
+mems=(80G 100G 60G 20G)
+times=('06:00:00' '06:00:00' '04:00:00' '02:00:00')
+folder=FN
+
+betas_FN=(
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_450k.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_epic.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch1.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch2.rds")
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript get_residuals_agesexbatchcellcounts30controlPCs.R \
+--beta ${betas_FN[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--batch ${batches[$i]} \
+--out ../data/FN/beta_FN_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs.rds
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name beta_FN_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs \
+-e ../logs/FN/beta_FN_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs.e \
+-o ../logs/FN/beta_FN_cleaned_filtered_postqc_${batches[$i]}_residuals_agesexbatchcellcounts30controlPCs.o 
+done
+```
+
+##### binary files 
+
+```{bash}
+residuals_FN=(
+"../data/FN/beta_FN_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs.rds"
+"../data/FN/beta_FN_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs.rds"
+"../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs.rds"
+"../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs.rds")
+folder=FN
+mems=(80G 80G 50G 30G)
+times=('02:00:00' '02:00:00' '02:00:00' '00:45:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${residuals_FN[$i]} \
+--type other \
+--sex sep \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_FN_residuals.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${residuals_FN[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_FN_residuals_agesexbatchcellcounts30controlPCs \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_FN_residuals_agesexbatchcellcounts30controlPCs.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_FN_residuals_agesexbatchcellcounts30controlPCs.o 
+done
+```
+
+##### perform PCA
+
+```{bash}
+befiles_residuals_FN=(
+"../data/FN/beta_FN_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/beta_FN_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs")
+
+orms_residuals_FN=(
+"../data/FN/orm_beta_FN_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/orm_beta_FN_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/orm_beta_FN_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/orm_beta_FN_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs")
+
+pca_residuals_FN=(
+"../data/FN/pca_beta_FN_cleaned_filtered_postqc_mine_450k_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/pca_beta_FN_cleaned_filtered_postqc_mine_epic_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/pca_beta_FN_cleaned_filtered_postqc_AUS_batch1_residuals_agesexbatchcellcounts30controlPCs"
+"../data/FN/pca_beta_FN_cleaned_filtered_postqc_AUS_batch2_residuals_agesexbatchcellcounts30controlPCs")
+
+folder=FN
+mems=(60G 80G 40G 20G)
+times=('03:30:00' '03:30:00' '01:30:00' '01:30:00')
+for i in 0 1 2 3 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript make_orm.R \
+--befile ${befiles_residuals_FN[$i]} \
+--orm ${orms_residuals_FN[$i]} \
+--pca ${pca_residuals_FN[$i]} \
+--removeprobes ${removeprobes[$i]} \
+--npcs 100
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name orm_FN_residuals_agesexbatchcellcounts30controlPCs_${batches[$i]} \
+-e ${logs[$i]}/${folder}/orm_FN_residuals_agesexbatchcellcounts30controlPCs_${batches[$i]}.e \
+-o ${logs[$i]}/${folder}/orm_FN_residuals_agesexbatchcellcounts30controlPCs_${batches[$i]}.o
+done
+```
+
+##### add PCs to samplesheet
+
+```{r}
+## add residual PCs to samplesheet
+library(tidyverse)
+samplesheet <- readRDS("../data/samplesheet_merged.rds")
+
+getPCA <- function(batch) {
+  
+  ## PCA
+  pca <- readr::read_table2(sprintf("%s/FN/pca_beta_FN_cleaned_filtered_postqc_%s_residuals_agesexbatchcellcounts30controlPCs.eigenvec", datadir, batch), col_names=FALSE)
+  samples <- pca$X1
+  pca$X1 <- pca$X2 <- NULL
+  colnames(pca) <- paste0("PC", 1:ncol(pca), "_res")
+  pca$Sample_Name <- samples
+  pca
+}
+
+pca <- purrr::map_df(unique(samplesheet$Study), .f = getPCA)
+
+samplesheet <- samplesheet %>%
+  dplyr::left_join(
+    pca, by = "Sample_Name"
+  ) 
+
+## Save samplesheet
+saveRDS(samplesheet, file = "../data/FN/samplesheet_FN_merged_PCs_residuals_agesexbatchcellcounts30controlPCs.rds")
+for(study in unique(samplesheet$Study)) {
+  saveRDS(samplesheet %>% filter(Study == study), 
+          file = sprintf("../data/FN/samplesheet_FN_%s_PCs_residuals_agesexbatchcellcounts30controlPCs.rds", study))
+}
+```
+
+#### MOA 
+
+```{bash}
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '06:00:00' '04:00:00')
+name="ewas_FN_moa_covarsexbatch_qcovarage_missing0.05"
+folder=sensitivity
+befiles_FN=(
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_450k"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_epic"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch1"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch2")
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles_FN[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+
+#### linear model (fine-tuned1.15)
+
+```{bash}
+samplesheets_res_FN=("$datadir/FN/samplesheet_FN_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs.rds"
+              "$datadir/FN/samplesheet_FN_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs.rds"
+              "$datadir/FN/samplesheet_FN_AUS_batch1_PCs_residuals_agesexbatchcellcounts30controlPCs.rds"
+              "$datadir/FN/samplesheet_FN_AUS_batch2_PCs_residuals_agesexbatchcellcounts30controlPCs.rds")
+              
+betas_FN=(
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_450k.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_mine_epic.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch1.rds"
+  "../data/FN/beta_FN_cleaned_filtered_postqc_AUS_batch2.rds")
+      
+names=(
+"ewas_FN_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_FN_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_FN_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_FN_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=sensitivity
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas_FN[$i]} \
+--samplesheet ${samplesheets_res_FN[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### Mvalues
+
+EWAS on M-values instead of beta-values.
+
+#### transform betas to mvalues
+
+```{bash}
+mems=(120G 150G 60G 35G)
+times=('02:00:00' '02:00:00' '01:30:00' '01:00:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript beta_to_mvalues.R \
+--beta ${betas[$i]} \
+--mvalues ../data/mvalues/mvalues_cleaned_filtered_postqc_${batches[$i]}.rds
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name beta_to_mvalues_${batches[$i]} \
+-e ../logs/mvalues/beta_to_mvalues_${batches[$i]}.e \
+-o ../logs/mvalues/beta_to_mvalues_${batches[$i]}.o 
+done
+```
+
+#### create binary files
+
+```{bash}
+mvalues=(
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_mine_450k.rds"
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_mine_epic.rds"
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_AUS_batch1.rds"
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_AUS_batch2.rds")
+
+mems=(80G 80G 30G 20G)
+times=('01:30:00' '01:30:00' '01:00:00' '00:45:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${mvalues[$i]} \
+--type mvalues \
+--sex sep \
+--log ${logs[$i]}/mvalues/${prefixes[$i]}_create_binary_files_mvalues.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${mvalues[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_mvalues \
+-e ${logs[$i]}/mvalues/${prefixes[$i]}_create_binary_files_mvalues.e \
+-o ${logs[$i]}/mvalues/${prefixes[$i]}_create_binary_files_mvalues.o 
+done
+```
+
+#### linear model (fine-tuned1.15)
+
+```{bash}
+mvalues=(
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_mine_450k.rds"
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_mine_epic.rds"
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_AUS_batch1.rds"
+  "../data/mvalues/mvalues_cleaned_filtered_postqc_AUS_batch2.rds")
+      
+names=(
+"ewas_mvalues_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_mvalues_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_mvalues_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_mvalues_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=sensitivity
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${mvalues[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### Exclude C9-positive individuals
+
+#### Probes missing in entire batches
+
+```{r}
+## Libraries
+library(tidyverse)
+library(magrittr)
+library(Matrix)
+
+tib <- tibble(
+  Study =  cohorts,
+  missingness_matrix = sprintf(c("%s/missingness_matrix_%s.rds"
+  ), datadir, cohorts),
+  data = sprintf("%s", datadir)
+)
+
+get_mean_missingness_perbatch <- function(batch, samplesheet, missingness) {
+  print(batch)
+  samplesheet_ <- samplesheet %>% dplyr::filter(Batch == batch)
+  missingness_ <- missingness[,samplesheet_$Sample_Name]
+  prop_missing <- rowMeans(missingness_)
+  prop_missing <- prop_missing[prop_missing == 1]
+  if(length(prop_missing) > 0) {
+    return(names(prop_missing))
+  } else {
+    return(NA)
+  }
+}
+
+get_probes <- function(batch, samplesheet, tib) {
+  library(Matrix)
+  missingness_mat <- readRDS((tib %>% filter(Study == batch) %$% missingness_matrix))
+  opi <- readr::read_tsv(sprintf("%s/beta_cleaned_filtered_postqc_%s.opi", inputdir,batch), col_names=FALSE)
+  missingness_mat <- missingness_mat[rownames(missingness_mat) %in% opi$X2,]
+  samplesheet_tmp <- samplesheet %>% filter(Study == batch)
+  missingness_mat <- missingness_mat[,samplesheet_tmp$Sample_Name]
+  probes <- unlist(purrr::map(unique(samplesheet_tmp$Batch), .f = get_mean_missingness_perbatch, 
+                              samplesheet = samplesheet_tmp, missingness = missingness_mat))
+  probes <- unique(probes[!is.na(probes)])
+  probes
+}
+
+## Check if there are probes with missingness in 1 batch
+samplesheet_merged <- readRDS("../data/samplesheet_merged.rds")
+keep_c9negative <- readr::read_lines("../data/sensitivity/merged_keep_c9negative.txt")
+samplesheet_merged <- samplesheet_merged %>% dplyr::filter(Sample_Name %in% keep_c9negative)
+
+
+probes <- purrr::map(tib$Study, .f = get_probes, samplesheet = samplesheet_merged, tib = tib)
+names(probes) <- tib$Study
+
+for(batch in unique(tib$Study)) {
+  remove_probes <- probes[[batch]]
+  dat <- tib %>% dplyr::filter(Study == batch) %$% data
+  readr::write_lines(remove_probes, path = sprintf("%s/remove_probes_missingbatch_c9negative_%s", dat, batch))
+}
+
+## Downsampled
+samplesheet_merged <- readRDS("../data/samplesheet_merged.rds")
+keep_c9downsampled <- readr::read_lines("../data/sensitivity/merged_keep_c9sensitivity_downsampled.txt")
+samplesheet_merged <- samplesheet_merged %>% dplyr::filter(Sample_Name %in% keep_c9downsampled)
+
+
+probes <- purrr::map(tib$Study, .f = get_probes, samplesheet = samplesheet_merged, tib = tib)
+names(probes) <- tib$Study
+
+for(batch in unique(tib$Study)) {
+  remove_probes <- probes[[batch]]
+  dat <- tib %>% dplyr::filter(Study == batch) %$% data
+  readr::write_lines(remove_probes, path = sprintf("%s/remove_probes_missingbatch_c9sensitivity_downsampled_%s", dat, batch))
+}
+```
+
+```{bash}
+removeprobes_c9negative=("$datadir/remove_probes_missingbatch_c9negative_mine_450k" 
+              "$datadir/remove_probes_missingbatch_c9negative_mine_epic"
+              "$datadir/remove_probes_missingbatch_c9negative_AUS_batch1"
+              "$datadir/remove_probes_missingbatch_c9negative_AUS_batch2")
+
+removeprobes_c9sensitivity_downsampled=("$datadir/remove_probes_missingbatch_c9sensitivity_downsampled_mine_450k" 
+              "$datadir/remove_probes_missingbatch_c9sensitivity_downsampled_mine_epic"
+              "$datadir/remove_probes_missingbatch_c9sensitivity_downsampled_AUS_batch1"
+              "$datadir/remove_probes_missingbatch_c9sensitivity_downsampled_AUS_batch2")
+```
+
+#### MOA
+
+Exclude C9 carriers (note C9 status is only available for MinE samples)
+
+```{bash}
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '06:00:00' '04:00:00')
+name="ewas_noc9_moa_covarsexbatch_qcovarage_missing0.05"
+folder=sensitivity
+
+for i in 0 1 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes_c9negative[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--keepsamples ../data/sensitivity/merged_keep_c9negative.txt \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+
+Downsampled EWAS including C9 carriers (but with same sample size as C9-negative EWAS)
+
+```{bash}
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '06:00:00' '04:00:00')
+name="ewas_c9sensitivity_downsampled_moa_covarsexbatch_qcovarage_missing0.05"
+folder=sensitivity
+
+for i in 0 1 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes_c9sensitivity_downsampled[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--keepsamples ../data/sensitivity/merged_keep_c9sensitivity_downsampled.txt \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+
+#### linear model (fine-tuned1.15)
+
+Exclude C9 carriers (note C9 status is only available for MinE samples)
+
+```{bash}
+names=(
+"ewas_noc9_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_noc9_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_noc9_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_noc9_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=sensitivity
+
+for i in 0 1 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes_c9negative[$i]} \
+--keepsamples ../data/sensitivity/merged_keep_c9negative.txt \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+Downsampled EWAS including C9 carriers (but with same sample size as C9-negative EWAS)
+
+```{bash}
+names=(
+"ewas_c9sensitivity_downsampled_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_c9sensitivity_downsampled_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_c9sensitivity_downsampled_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_c9sensitivity_downsampled_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=sensitivity
+
+for i in 0 1 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes_c9sensitivity_downsampled[$i]} \
+--keepsamples ../data/sensitivity/merged_keep_c9sensitivity_downsampled.txt \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### OOB 
+
+#### Get normalized OOB beta-matrices
+
+```{bash}
+outs_oob=("$datadir/oob_betas_normalized_mine_450k.rds" 
+"$datadir/oob_betas_normalized_mine_epic.rds" 
+"$datadir/oob_betas_normalized_AUS_batch1.rds" 
+"$datadir/oob_betas_normalized_AUS_batch2.rds") 
+
+times=("03:00:00" "03:00:00" "01:30:00" "00:45:00")
+mems=(150G 200G 10G 30G)
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript get_oob.R \
+--rgset ${rgsets[$i]} \
+--samplesheet ${samplesheets[$i]} \
+--out ${outs_oob[$i]} 
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+-e ../logs/oob/oob_betas_normalized_${batches[$i]}.e \
+-o ../logs/oob/oob_betas_normalized_${batches[$i]}.o \
+--job-name oob_betas_normalized_${batches[$i]}
+done
+```
+
+#### create binary files 
+
+```{bash}
+mems=(80G 80G 30G 20G)
+times=('01:30:00' '01:30:00' '01:00:00' '00:45:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${outs_oob[$i]} \
+--type beta \
+--sex sep \
+--log ${logs[$i]}/oob/${prefixes[$i]}_create_binary_files.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${outs_oob[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_oob \
+-e ${logs[$i]}/oob/${prefixes[$i]}_create_binary_files_oob.e \
+-o ${logs[$i]}/oob/${prefixes[$i]}_create_binary_files_oob.o 
+done
+```
+
+```{bash}
+befiles_oob=("%s/oob_betas_normalized_mine_450k" 
+"%s/oob_betas_normalized_mine_epic" 
+"%s/oob_betas_normalized_AUS_batch1" 
+"%s/oob_betas_normalized_AUS_batch2")
+```
+
+#### EWAS
+
+```{bash}
+oob_betas=("$datadir/oob_betas_normalized_mine_450k.rds" 
+"$datadir/oob_betas_normalized_mine_epic.rds" 
+"$datadir/oob_betas_normalized_AUS_batch1.rds" 
+"$datadir/oob_betas_normalized_AUS_batch2.rds")
+              
+names=(
+"ewas_oob_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_oob_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_oob_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_oob_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=oob
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${oob_betas[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### Total intensities
+
+#### Get normalized total intensities
+
+```{bash}
+out_total=(
+  "../data/total_intensities/intensities_mine_450k"
+  "../data/total_intensities/intensities_mine_epic"
+  "../data/total_intensities/intensities_AUS_batch1"
+  "../data/total_intensities/intensities_AUS_batch2")
+
+types=(
+"dasen"
+"dasen"
+"nanes"
+"dasen")
+
+name="get_total_intensities"
+keep_samples="../data/keep_samples_all.txt"
+
+mems=(250G 350G 100G 50G)
+times=('04:00:00' '06:00:00' '02:00:00' '01:30:00')
+folder=total_intensities
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript get_total_intensities.R \
+--mset ${msets[$i]} \
+--keepsamples $keep_samples \
+--type ${types[$i]} \
+--out ${out_total[$i]} \
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+#### create binary files
+
+```{bash}
+total_intensities=(
+  "../data/total_intensities/intensities_mine_450k_total.rds"
+  "../data/total_intensities/intensities_mine_epic_total.rds"
+  "../data/total_intensities/intensities_AUS_batch1_total.rds"
+  "../data/total_intensities/intensities_AUS_batch2_total.rds")   
+folder=total_intensities
+mems=(80G 80G 50G 30G)
+times=('02:00:00' '02:00:00' '02:00:00' '00:45:00')
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript create_binary_files.R \
+--beta ${total_intensities[$i]} \
+--type other \
+--sex sep \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_total_intensities.log \
+--array ${arrays[$i]} \
+--opi ../data/annotated_${arrays[$i]}.opi \
+--out $(sed 's/.rds//g' <<< "${total_intensities[$i]}")
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_create_binary_files_total_intensities \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_total_intensities.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_create_binary_files_total_intensities.o 
+done
+```
+
+#### EWAS
+
+```{bash}
+total_intensities=(
+  "../data/total_intensities/intensities_mine_450k_total.rds"
+  "../data/total_intensities/intensities_mine_epic_total.rds"
+  "../data/total_intensities/intensities_AUS_batch1_total.rds"
+  "../data/total_intensities/intensities_AUS_batch2_total.rds")    
+  
+names=(
+"ewas_limma_total_intensities_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_limma_total_intensities_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05"
+"ewas_limma_total_intensities_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_missing0.05"
+"ewas_limma_total_intensities_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05")
+
+nPCs=(30 15 25 30)
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '08:00:00' '06:00:00')
+folder=total_intensities
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${total_intensities[$i]} \
+--samplesheet ${samplesheets_res[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### Adjust for genetic PCs
+
+#### MOA 
+
+adjust for 10 genetic PCs 
+
+```{bash}
+samplesheetsgeneticPCs=(
+"$datadir/samplesheet_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_AUS_batch1_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_AUS_batch2_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds")
+
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '04:00:00' '04:00:00')
+name="ewas_moa_covarsexbatch_qcovarage10WGSPCs_missing0.05"
+folder=moa
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheetsgeneticPCs[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,$(for j in {1..10}; do echo "PC_WGS${j}";done | tr "\n" "," | sed 's/.$//') \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+#### MOA no adjustment, overlapping samples
+
+EWAS not adjusted for genetic PCs, but using samples for which genetic PCs are available
+
+```{bash}
+samplesheetsgeneticPCs=(
+"$datadir/samplesheet_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_AUS_batch1_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_AUS_batch2_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+)
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '04:00:00' '04:00:00')
+name="ewas_moa_covarsexbatch_qcovarage_WGSsamples_missing0.05"
+folder=moa
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheetsgeneticPCs[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch --time ${times[$i]} --mem ${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o 
+done
+```
+
+#### linear model (fine-tuned1.15)
+
+```{bash}
+samplesheetsgeneticPCs=(
+"$datadir/samplesheet_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_AUS_batch1_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds"
+"$datadir/samplesheet_AUS_batch2_PCs_residuals_agesexbatchcellcounts30controlPCs_wgs_df2_AUS_PCs.rds")
+```
+
+```{bash}
+names=(
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres10WGSPCs_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres10WGSPCs_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres10WGSPCs_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres10WGSPCs_missing0.05")
+nPCs=(30 15 25 30) 
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '12:00:00' '08:00:00') 
+folder=limma
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheetsgeneticPCs[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for j in {1..10}; do echo "PC_WGS${j}";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+#### linear model (fine-tuned1.15) no adjustment, overlapping samples
+
+EWAS not adjusted for genetic PCs, but using samples for which genetic PCs are available
+
+```{bash}
+names=(
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_WGSsamples_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_WGSsamples_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs25PCsres_WGSsamples_missing0.05"
+"ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_WGSsamples_missing0.05")
+
+nPCs=(30 15 25 30) 
+mems=(90G 100G 50G 25G)
+times=('12:00:00' '24:00:00' '12:00:00' '08:00:00') 
+folder=limma
+
+for i in 0 1 2 3
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheetsgeneticPCs[$i]} \
+--pheno ${pheno} \
+--levels ${levels} \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
+
+### Riluzole EWAS
+
+#### Prepare samplesheets
+
+updated samplesheet:
+
+```{r}
+library(dplyr); library(readr)
+samplesheet_riluzole <- readRDS("../data/pheno/samplesheet_AUS_MinE_phenotype_overview_102020.rds")
+samplesheet_merged <- readRDS("../data/PCs/samplesheet_merged_PCs_residuals_agesexbatchcellcounts30controlPCs.rds")
+samplesheet_merged <- samplesheet_merged %>%
+ dplyr::left_join(samplesheet_riluzole[,c("Sample_Name", "Riluzole_use_at_time_of_blooddraw")], by="Sample_Name") %>%
+ dplyr::filter(!is.na(Riluzole_use_at_time_of_blooddraw), caseControl_bin==1) %>%
+ dplyr::mutate(
+  Riluzole_use_at_time_of_blooddraw = ifelse(Riluzole_use_at_time_of_blooddraw == "Y", 1, ifelse(Riluzole_use_at_time_of_blooddraw == "N",0 ,NA)))
+
+for(study in unique(samplesheet_merged$Study)) {
+ samplesheet_ <- samplesheet_merged %>%
+   dplyr::filter(Study==study)
+ saveRDS(samplesheet_, file = sprintf("../data/misc/samplesheet_riluzole_%s_PCs_residuals_agesexbatchcellcounts30controlPCs.rds", study))
+}
+```
+
+#### missingness
+
+```{r}
+## Libraries
+library(tidyverse)
+library(magrittr)
+library(Matrix)
+
+tib <- tibble(
+  Study = c("mine_450k", "mine_epic"),
+  missingness_matrix = sprintf(c("%s/missingness_matrix_mine_450k.rds",
+                         "%s/missingness_matrix_mine_epic.rds"), datadir),
+  data = datadir
+)
+
+get_mean_missingness_perbatch <- function(batch, samplesheet, missingness) {
+  print(batch)
+  samplesheet_ <- samplesheet %>% dplyr::filter(Batch == batch)
+  missingness_ <- missingness[,samplesheet_$Sample_Name]
+  prop_missing <- rowMeans(missingness_)
+  prop_missing <- prop_missing[prop_missing == 1]
+  if(length(prop_missing) > 0) {
+    return(names(prop_missing))
+  } else {
+    return(NA)
+  }
+}
+
+get_probes <- function(batch, samplesheet, tib) {
+  library(Matrix)
+  missingness_mat <- readRDS((tib %>% filter(Study == batch) %$% missingness_matrix))
+  opi <- readr::read_tsv(sprintf("%s/beta_cleaned_filtered_postqc_%s.opi", inputdir,batch), col_names=FALSE)
+  missingness_mat <- missingness_mat[rownames(missingness_mat) %in% opi$X2,]
+  samplesheet_tmp <- samplesheet %>% filter(Study == batch)
+  missingness_mat <- missingness_mat[,samplesheet_tmp$Sample_Name]
+  probes <- unlist(purrr::map(unique(samplesheet_tmp$Batch), .f = get_mean_missingness_perbatch, 
+                              samplesheet = samplesheet_tmp, missingness = missingness_mat))
+  probes <- unique(probes[!is.na(probes)])
+  probes
+}
+
+## Check if there are probes with missingness in 1 batch
+samplesheet_mine_450k <- readRDS(sprintf("%s/misc/samplesheet_riluzole_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs.rds", datadir))
+samplesheet_mine_epic <- readRDS(sprintf("%s/misc/samplesheet_riluzole_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs.rds", datadir))
+samplesheet_merged <- dplyr::bind_rows(samplesheet_mine_450k, samplesheet_mine_epic)
+
+
+probes <- purrr::map(tib$Study, .f = get_probes, samplesheet = samplesheet_merged, tib = tib)
+names(probes) <- tib$Study
+
+for(batch in unique(tib$Study)) {
+  remove_probes <- probes[[batch]]
+  dat <- tib %>% dplyr::filter(Study == batch) %$% data
+  readr::write_lines(remove_probes, path = sprintf("%s/misc/remove_probes_missingbatch_riluzole_%s", dat, batch))
+}
+```
+
+#### MOA
+
+```{bash}
+samplesheets_res_riluzole=("$datadir/misc/samplesheet_riluzole_mine_450k_PCs_residuals_agesexbatchcellcounts30controlPCs.rds" 
+"$datadir/misc/samplesheet_riluzole_mine_epic_PCs_residuals_agesexbatchcellcounts30controlPCs.rds")
+removeprobes_riluzole=(
+"$datadir/misc/remove_probes_missingbatch_riluzole_mine_450k"
+"$datadir/misc/remove_probes_missingbatch_riluzole_mine_epic")    
+mems=(40G 50G 30G 20G)
+times=('08:00:00' '08:00:00' '06:00:00' '04:00:00')
+name="ewas_riluzole_moa_covarsexbatch_qcovarage_missing0.05"
+folder=misc
+
+for i in 0 1
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript mlma.R \
+--befile ${befiles[$i]} \
+--samplesheet ${samplesheets_res_riluzole[$i]} \
+--pheno Riluzole_use_at_time_of_blooddraw \
+--levels 0,1 \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removeprobes ${removeprobes_riluzole[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN \
+--method moa \
+--log ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.log \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${name}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${name} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${name}.o
+done
+```
+
+#### linear model (fine-tuned1.15)
+
+```{bash}
+names=(
+"ewas_riluzole_limma_covarsexbatch_qcovaragecellcounts30controlPCs30PCsres_missing0.05"
+"ewas_riluzole_limma_covarsexbatch_qcovaragecellcounts30controlPCs15PCsres_missing0.05")
+nPCs=(30 15)
+mems=(70G 70G)
+times=('05:00:00' '05:00:00')
+folder=misc
+
+for i in 0 1 
+do
+echo -e "\
+#!/bin/bash
+module load R/3.5.1
+Rscript limma.R \
+--beta ${betas[$i]} \
+--samplesheet ${samplesheets_res_riluzole[$i]} \
+--pheno Riluzole_use_at_time_of_blooddraw \
+--levels 0,1 \
+--array ${arrays[$i]} \
+--missingness ${missingnessmatrices[$i]} \
+--missthreshold 0.05 \
+--removexy y \
+--removeprobes ${removeprobes_riluzole[$i]} \
+--covariates Sex,Batch \
+--qcovariates Predicted_Age_Zhang_EN,CD4T,CD8T,Mono,NK,Gran,\
+$(for j in {1..30}; do echo "PC${j}_control";done | tr "\n" ",")\
+$(for ((j=1; j<=${nPCs[$i]}; j++ )); do echo "PC${j}_res";done | tr "\n" "," | sed 's/.$//') \
+--out ${outs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}
+" | sbatch -t ${times[$i]} --mem=${mems[$i]} \
+--job-name ${prefixes[$i]}_${names[$i]} \
+-e ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.e \
+-o ${logs[$i]}/${folder}/${prefixes[$i]}_${names[$i]}.o 
+done
+```
