@@ -1,0 +1,827 @@
+---
+title: "EWAS_sensitivity_analyses"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, warning=FALSE, message = FALSE, dev = "png")
+```
+
+```{r variables, include = FALSE, cache=FALSE}
+source("plot_ewas_functions.R")
+text_size=13
+point_size=2.5
+
+## Data
+load("prepared_data.rda")
+```
+
+```{r}
+## Functions
+results_lm <- function(probe, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_lm_per_study, probe = probe, covar_df = covar_df, samplesheet = samplesheet)
+  stats_meta <- meta_analysis(stats, probe = probe)
+  stats_meta$sample_size <- nrow(samplesheet)
+  stats_meta <- stats_meta %>% dplyr::select(Probe, sample_size, dplyr::everything())
+}
+
+run_lm_per_study <- function(study, probe, covar_df, samplesheet) {
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[probe]]))) {
+    covar <- covar_df[[study]]
+    formula <- as.formula(sprintf("%s ~ caseControl_bin + %s", probe, paste(covar, collapse = "+")))
+    model <- lm(formula, data = samplesheet %>% dplyr::filter(Study == study))
+    tibble(Probe = probe, Study = study, b = summary(model)$coef[2,1], se = summary(model)$coef[2,2], t = summary(model)$coef[2,3], p = summary(model)$coef[2,4])
+  } else {
+    NULL
+  }
+}
+
+leave_one_batch_out <- function(probe, samplesheet, covar_df, batch_variable = "Batch") {
+  batches <- unique(samplesheet[[batch_variable]])
+  batches <- batches[!batches %in% c("AUS_batch1", "AUS_batch2")]
+  
+  # statistics
+  stats <- purrr::map_df(batches, .f = run_lm_leave_batch_out, 
+                         probe = probe, 
+                         samplesheet = samplesheet, 
+                         batch_variable = batch_variable, 
+                         covar_df = covar_df)
+}
+
+run_lm_leave_batch_out <- function(leave_out_batch, probe, samplesheet, batch_variable, covar_df) {
+  samplesheet_temp <- samplesheet %>% dplyr::filter(!!as.name(batch_variable) != leave_out_batch)
+  test_stats <- purrr::map_df(unique(samplesheet$Study), 
+                              .f = run_lm_per_study, 
+                              probe = probe, 
+                              covar_df = covar_df, 
+                              samplesheet = samplesheet_temp)
+  test_stats_meta <- meta_analysis(test_stats, probe = probe)
+  test_stats_meta$leave_out_batch <- leave_out_batch
+  test_stats_meta$sample_size <- nrow(samplesheet_temp)
+  test_stats_meta <- test_stats_meta %>% dplyr::select(Probe, leave_out_batch, sample_size, dplyr::everything())
+}
+
+leave_one_cohort_out <- function(probe, samplesheet, covar_df, cohort_variable = "Study") {
+  # cohorts
+  samplesheet <- samplesheet[!is.na(samplesheet[[probe]]),]
+  cohorts <- unique(samplesheet[[cohort_variable]])
+  if(length(cohorts) > 1) {
+    stats <- purrr::map_df(cohorts, .f = run_lm_leave_cohort_out, probe = probe, samplesheet = samplesheet, cohort_variable = cohort_variable, covar_df = covar_df)
+  } else {
+    NULL
+  }
+  
+}
+
+run_lm_leave_cohort_out <- function(leave_out_cohort, probe, samplesheet, cohort_variable, covar_df) {
+  samplesheet_temp <- samplesheet %>% dplyr::filter(!!as.name(cohort_variable) != leave_out_cohort)
+  test_stats <- purrr::map_df(unique(samplesheet_temp$Study), .f = run_lm_per_study, probe = probe, covar_df = covar_df, samplesheet = samplesheet_temp)
+  test_stats_meta <- meta_analysis(test_stats, probe = probe)
+  test_stats_meta$leave_out_cohort <- leave_out_cohort
+  test_stats_meta$sample_size <- nrow(samplesheet_temp)
+  test_stats_meta <- test_stats_meta %>% dplyr::select(Probe, leave_out_cohort, sample_size, dplyr::everything())
+}
+
+compare_pvals2 <- function(stats1, stats2, label1, label2, highlight = NULL, highlight_sig = TRUE,
+                          threshold = NULL, text_size = 9, point_size = 1, show_legend = TRUE,
+                          annotation = NULL, col = NULL, col_which = 2, plot_threshold = FALSE) {
+  
+  # Add logp
+  stats1 <- stats1 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+  stats2 <- stats2 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+
+  # Add logp
+  if(is.null(threshold)) {
+    threshold <- 0.05 / nrow(stats1)
+  }
+  
+  if(!is.null(col) && col_which == 2) {
+    combined <- stats1[,c("Probe", "p", "b", "t", "logp")] %>%
+      dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp", col)], by = "Probe") %>%
+      dplyr::mutate(Sig = dplyr::case_when(
+        p.x < threshold & p.y < threshold ~ "Both Sig",
+        p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+        p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+        TRUE ~ "Not Sig"
+      )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                      sprintf("%s Sig", label1), "Not Sig")))
+  } else if(!is.null(col) && col_which == 1) {
+    combined <- stats1[,c("Probe", "p", "b", "t", "logp", col)] %>%
+      dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp")], by = "Probe") %>%
+      dplyr::mutate(Sig = dplyr::case_when(
+        p.x < threshold & p.y < threshold ~ "Both Sig",
+        p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+        p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+        TRUE ~ "Not Sig"
+      )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                      sprintf("%s Sig", label1), "Not Sig")))
+  } else {
+    combined <- stats1[,c("Probe", "p", "b", "t", "logp")] %>%
+      dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp")], by = "Probe") %>%
+      dplyr::mutate(Sig = dplyr::case_when(
+        p.x < threshold & p.y < threshold ~ "Both Sig",
+        p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+        p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+        TRUE ~ "Not Sig"
+      )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                      sprintf("%s Sig", label1), "Not Sig")))
+  }
+  
+  if(!is.null(highlight)) {
+    combined <- combined %>% dplyr::mutate(highlight = ifelse(Probe %in% highlight, TRUE, FALSE))
+  }
+  
+  max <- max(combined$logp.x, combined$logp.y, na.rm = TRUE)
+  min <- 0
+  
+  color_values <- c("black", "#BC3C29", "#0072B5", "#E18727")
+  color_values_names <- c("Not Sig", "Both Sig", sprintf("%s Sig", label2), sprintf("%s Sig", label1))
+  names(color_values) <- color_values_names
+  
+  if(highlight_sig) {
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y, color = Sig)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(Sig != "Not Sig"), alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      scale_color_manual(values = color_values) +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else if (!is.null(annotation)) {
+    combined <- combined %>%
+      dplyr::left_join(annotation, by = "Probe")
+    g <- ggplot(combined, aes_string(x = "logp.x",
+                              y = "logp.y", color = col)) +
+      geom_point(data = combined %>% filter(is.na(Annotation)), alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(!is.na(Annotation)),
+                 aes(color = Annotation, shape = Annotation),
+                 alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      colorblindr::scale_color_OkabeIto() +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else {
+    g <- ggplot(combined, aes_string(x = "logp.x",
+                              y = "logp.y", color = col)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      colorblindr::scale_color_OkabeIto() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+  }
+  
+  if(!is.null(highlight)) {
+    g <- g + geom_point(data = combined %>% dplyr::filter(highlight),
+                        size = point_size, color = "red", shape = 8)
+  }
+  
+  if(plot_threshold) {
+    g <- g +
+      geom_hline(yintercept = -log10(threshold), linetype = "dashed") +
+      geom_vline(xintercept = -log10(threshold), linetype = "dashed")
+  }
+  
+  g
+}
+
+compare_Qpvals <- function(stats1, stats2, label1, label2, highlight = NULL, highlight_sig = TRUE,
+                          threshold = NULL, text_size = 9, point_size = 1, show_legend = TRUE,
+                          annotation = NULL, col = NULL, col_which = 2, plot_threshold = FALSE) {
+  
+  # Add logp
+  stats1 <- stats1 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+  stats2 <- stats2 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+
+  
+  # Add logp
+  if(is.null(threshold)) {
+    threshold <- 0.05 / nrow(stats1)
+  }
+  
+  if(!is.null(col) && col_which == 2) {
+    combined <- stats1[,c("Probe", "p", "b", "t", "logp")] %>%
+      dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp", col)], by = "Probe") %>%
+      dplyr::mutate(Sig = dplyr::case_when(
+        p.x < threshold & p.y < threshold ~ "Both Sig",
+        p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+        p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+        TRUE ~ "Not Sig"
+      )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                      sprintf("%s Sig", label1), "Not Sig")))
+  } else if(!is.null(col) && col_which == 1) {
+    combined <- stats1[,c("Probe", "p", "b", "t", "logp", col)] %>%
+      dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp")], by = "Probe") %>%
+      dplyr::mutate(Sig = dplyr::case_when(
+        p.x < threshold & p.y < threshold ~ "Both Sig",
+        p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+        p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+        TRUE ~ "Not Sig"
+      )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                      sprintf("%s Sig", label1), "Not Sig")))
+  } else {
+    combined <- stats1[,c("Probe", "p", "b", "t", "logp")] %>%
+      dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp")], by = "Probe") %>%
+      dplyr::mutate(Sig = dplyr::case_when(
+        p.x < threshold & p.y < threshold ~ "Both Sig",
+        p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+        p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+        TRUE ~ "Not Sig"
+      )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                      sprintf("%s Sig", label1), "Not Sig")))
+  }
+  
+  if(!is.null(highlight)) {
+    combined <- combined %>% dplyr::mutate(highlight = ifelse(Probe %in% highlight, TRUE, FALSE))
+  }
+  
+  max <- max(combined$logp.x, combined$logp.y, na.rm = TRUE)
+  min <- 0
+  
+  color_values <- c("black", "#BC3C29", "#0072B5", "#E18727")
+  color_values_names <- c("Not Sig", "Both Sig", sprintf("%s Sig", label2), sprintf("%s Sig", label1))
+  names(color_values) <- color_values_names
+  
+  if(highlight_sig) {
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y, color = Sig)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(Sig != "Not Sig"), alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      scale_color_manual(values = color_values) +
+      labs(x = bquote(-log[10](italic(Q.P)) ~ .(label1)),
+           y = bquote(-log[10](italic(Q.P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else if (!is.null(annotation)) {
+    combined <- combined %>%
+      dplyr::left_join(annotation, by = "Probe")
+    g <- ggplot(combined, aes_string(x = "logp.x",
+                              y = "logp.y", color = col)) +
+      geom_point(data = combined %>% filter(is.na(Annotation)), alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(!is.na(Annotation)),
+                 aes(color = Annotation, shape = Annotation),
+                 alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(Q.P)) ~ .(label1)),
+           y = bquote(-log[10](italic(Q.P)) ~ .(label2))) +
+      theme_classic() +
+      colorblindr::scale_color_OkabeIto() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else {
+    g <- ggplot(combined, aes_string(x = "logp.x",
+                              y = "logp.y", color = col)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(Q.P)) ~ .(label1)),
+           y = bquote(-log[10](italic(Q.P)) ~ .(label2))) +
+      theme_classic() +
+      colorblindr::scale_color_OkabeIto() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+  }
+  
+  if(!is.null(highlight)) {
+    g <- g + geom_point(data = combined %>% dplyr::filter(highlight),
+                        size = point_size, color = "red", shape = 8)
+  }
+  
+  if(plot_threshold) {
+    g <- g +
+      geom_hline(yintercept = -log10(threshold), linetype = "dashed") +
+      geom_vline(xintercept = -log10(threshold), linetype = "dashed")
+  }
+  
+  g
+}
+
+plot_leave_one_batch_out <- function(probe, stats, threshold, text_size = 12, point_size=2.5) {
+  stats %>% 
+    dplyr::filter(Probe == probe) %>%
+    dplyr::arrange(sample_size) %>% 
+    dplyr::mutate(leave_out_batch = factor(leave_out_batch, levels = unique(leave_out_batch)))  %>% 
+    ggplot(aes(x = leave_out_batch, y = -log10(p))) +
+      geom_point(size = point_size) + 
+      theme_classic() +
+      theme(
+        text = element_text(size = text_size),
+        axis.text.x = element_text(angle=45, hjust=1, size = text_size)
+        ) +
+    geom_hline(yintercept = -log10(threshold), linetype = "dashed", col = "red") +
+    ylab("\n\n\n\n\n\n\n\n\n\n-log10(P)") +
+    ggtitle(probe)
+}
+
+plot_leave_one_cohort_out <- function(probe, stats, threshold, text_size = 12, point_size=2.5) {
+  stats %>% 
+    dplyr::filter(Probe == probe) %>%
+    dplyr::arrange(sample_size) %>% 
+    dplyr::mutate(leave_out_cohort = factor(leave_out_cohort, levels = unique(leave_out_cohort)))  %>% 
+    ggplot(aes(x = leave_out_cohort, y = -log10(p))) +
+      geom_point(size = point_size) + 
+      theme_classic() +
+      theme(
+        text = element_text(size = text_size),
+        axis.text.x = element_text(angle=45, hjust=1, size = text_size)
+        ) +
+    geom_hline(yintercept = -log10(threshold), linetype = "dashed", col = "red") +
+    ylab("-log10(P)") +
+    ggtitle(probe)
+}
+
+plot_leave_one_cohort_out_Qp <- function(probe, stats, text_size = 12, point_size=2.5) {
+  stats %>% 
+    dplyr::filter(Probe == probe) %>%
+    dplyr::arrange(sample_size) %>% 
+    dplyr::mutate(leave_out_cohort = factor(leave_out_cohort, levels = unique(leave_out_cohort)))  %>% 
+    ggplot(aes(x = leave_out_cohort, y = -log10(Q.p))) +
+      geom_point(size = point_size) + 
+      theme_classic() +
+      theme(
+        text = element_text(size = text_size),
+        axis.text.x = element_text(angle=45, hjust=1, size = text_size)
+        ) +
+    ylab("-log10(Q.P)") +
+    ggtitle(probe)
+}
+```
+
+
+# MOA
+
+## General sensitivity analyses
+
+```{r}
+### FN
+moa_FN <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_ewas_FN_moa_covarsexbatch_qcovarage_missing0.05_thresh1.tsv.gz")
+
+### leave out case batches
+moa_leave_out_case_only <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_ewas_nocaseonly_moa_covarsexbatch_qcovarage_missing0.05_thresh1.tsv.gz")
+
+### Leave out AUS strata
+moa_no_AUS <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_ewas_moa_covarsexbatch_qcovarage_missing0.05_thresh1.tsv.gz")
+
+### Leave out C9
+moa_noc9 <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_ewas_noc9_moa_covarsexbatch_qcovarage_missing0.05_thresh1.tsv.gz")
+moa_downsampled <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_ewas_c9sensitivity_downsampled_covarsexbatch_qcovarage_missing0.05_thresh1.tsv.gz")
+
+### 10 genetic PCs 
+moa_WGS_samples <- readr::read_tsv("../meta_analysis/output/moa/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_ewas_moa_covarsexbatch_qcovarage_WGSsamples_missing0.05_thresh1.tsv.gz")
+ 
+moa_10WGSPCs <- readr::read_tsv("../meta_analysis/output/moa/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_ewas_moa_covarsexbatch_qcovarage10WGSPCs_missing0.05_thresh1.tsv.gz")
+
+### Riluzole EWAS
+moa_riluzole <- readr::read_tsv("../meta_analysis/output/misc/ewas_122019_meta_mine_450k_mine_epic_ewas_riluzole_moa_covarsexbatch_qcovarage_missing0.05_thresh1.tsv.gz")
+```
+
+### Leave out case-only batches
+
+```{r}
+compare_pvals(
+  stats1 = moa %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = moa_leave_out_case_only,
+  label1 = "- MOA",
+  label2 = "- MOA no case-only",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+
+### Leave out Australian data
+
+```{r}
+compare_pvals(
+  stats1 = moa %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = moa_no_AUS,
+  label1 = "- MOA",
+  label2 = "- MOA no AUS",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+### Functional normalization 
+
+```{r}
+compare_pvals(
+  stats1 = moa %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = moa_FN,
+  label1 = "- MOA dasen/nanes",
+  label2 = "- MOA FN",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+### M-values
+
+OSCA did not converge for mine_450k cohort, this sensitivity analysis is included in the linear+bacon results, where using m-values vs. betas is shown to have little effect.
+
+### Leave out C9 samples 
+
+C9 status was not available for the Australian samples, so these were excluded for this sensitivity analysis. In total, `r max(moa_noc9$nr_samples)` were used for this analysis. The c9-negative EWAS was compared with a down-sampled EWAS with the same number of samples (leaving in C9-positive samples)
+
+```{r}
+hlight <- anno %>% dplyr::filter(stringr::str_detect(Gene, "C9orf72")) %$% Name
+
+compare_pvals(
+  stats1 = moa_downsampled %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = moa_noc9,
+  label1 = "- MOA (downsampled)",
+  label2 = "- MOA c9 negative",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight  = hlight,
+  highlight_sig = FALSE
+)
+```
+
+
+### Include 10 genetic PCs
+
+```{r}
+compare_MOA_WGS_samples_10WGSPCs=compare_pvals2(
+  stats1 = moa_WGS_samples %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = moa_10WGSPCs %>% dplyr::filter(!Probe %in% excl_probes),
+  label1 = "MOA main (overlapping samples)",
+  label2 = "MOA 10 genetic PCs",
+  text_size=13,
+  point_size=2,
+  highlight_sig = FALSE
+)
+compare_MOA_WGS_samples_10WGSPCs
+```
+
+### Riluzole EWAS
+
+```{r}
+compare_pvals(
+  stats1 = moa %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = moa_riluzole,
+  label1 = " - MOA case/con",
+  label2 = " - MOA riluzole ",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold, 
+  highlight_sig = FALSE)
+```
+
+#  LB algorithm
+
+## General sensitivity analyses
+
+```{r}
+### FN
+limma_tunedlambda1000_1.15_FN <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_FN_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+### leave out case batches
+limma_tunedlambda1000_1.15_leave_out_case_only <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_nocaseonly_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+### Leave out AUS strata
+limma_tunedlambda1000_1.15_no_AUS <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+### Leave out AUS2
+limma_tunedlambda1000_1.15_no_AUS_batch2 <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+
+### mvalues
+limma_tunedlambda1000_1.15_mvalues <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_mvalues_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+## Leave out C9 cases
+limma_tunedlambda1000_1.15_noc9 <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_noc9_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+limma_tunedlambda1000_1.15_downsampled <- readr::read_tsv("../meta_analysis/output/sensitivity/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_c9sensitivity_downsampled_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+
+## 10 genetic PCs
+LB_WGS_samples <- readr::read_tsv("../meta_analysis/output/limma/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_WGSsamples_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1.tsv.gz")
+
+LB_10WGSPCs <- readr::read_tsv("../meta_analysis/output/limma/ewas_122019_meta_mine_450k_mine_epic_AUS_batch1_AUS_batch2_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs10WGSPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1.tsv.gz")
+
+### Riluzole EWAS
+limma_riluzole_tunedlambda1000_1.15 <- readr::read_tsv("../meta_analysis/output/misc/ewas_122019_meta_mine_450k_mine_epic_ewas_riluzole_limma_covarsexbatch_qcovaragecellcounts30controlPCs_tunedlambda1000_1.15_minPCs10_missing0.05_thresh1_bacon.tsv.gz")
+```
+
+### Leave out case-only batches
+
+```{r}
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15 %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_tunedlambda1000_1.15_leave_out_case_only,
+  label1 = "- linear model",
+  label2 = "- linear model no case-only",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+
+### Leave out Australian data
+
+Both AUS1 and AUS2:
+
+```{r}
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15 %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_tunedlambda1000_1.15_no_AUS,
+  label1 = "- linear model",
+  label2 = "- linear model no AUS",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+Only AUS2:
+
+```{r}
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15 %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_tunedlambda1000_1.15_no_AUS_batch2,
+  label1 = "- linear model",
+  label2 = "- linear model no AUS_batch2",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+
+### Functional normalization 
+
+```{r}
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15 %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_tunedlambda1000_1.15_FN,
+  label1 = "- linear model dasen/nanes",
+  label2 = "- linear model FN",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+### M-values
+
+```{r}
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15 %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_tunedlambda1000_1.15_mvalues,
+  label1 = "- linear model betas",
+  label2 = "- linear model mvalues",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+### Leave out C9 samples
+
+C9 status was not available for the Australian samples, so these were excluded for this sensitivity analysis. In total, `r max(limma_tunedlambda1000_1.15_noc9$nr_samples)` were used for this analysis. The c9-negative EWAS was compared with a down-sampled EWAS with the same number of samples (leaving in C9-positive samples)
+
+```{r}
+hlight <- anno %>% dplyr::filter(stringr::str_detect(Gene, "C9orf72")) %$% Name
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15_downsampled %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_tunedlambda1000_1.15_noc9,
+  label1 = "- linear model (downsampled)",
+  label2 = "- linear model (c9 negative)",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight = hlight,
+  highlight_sig = FALSE
+)
+```
+
+### Include 10 genetic PCs
+
+```{r}
+compare_LB_WGS_samples_10WGSPCs <- compare_pvals2(
+  stats1 = LB_WGS_samples %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = LB_10WGSPCs %>% dplyr::filter(!Probe %in% excl_probes),
+  label1 = "LB main (overlapping samples)",
+  label2 = "LB 10 genetic PCs",
+  text_size=13,
+  point_size=2,
+  highlight_sig = FALSE
+)
+compare_LB_WGS_samples_10WGSPCs
+```
+
+### Riluzole EWAS
+
+```{r}
+compare_pvals(
+  stats1 = limma_tunedlambda1000_1.15 %>% dplyr::filter(!Probe %in% excl_probes),
+  stats2 = limma_riluzole_tunedlambda1000_1.15,
+  label1 = " - linear+bacon case/con",
+  label2 = " - linear+bacon riluzole",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold,
+  highlight_sig = FALSE
+)
+```
+
+## Leave-one-out analyses
+
+### Leave-one-batch-out
+
+```{r}
+## Covars (limma_tuned_1.15)
+covar_df <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+
+leave_one_batch_out_results_limma_tunedlambda1000_1.15 <- purrr::map_df(limma_tunedlambda1000_1.15_sig$Probe, 
+                                           .f = leave_one_batch_out, 
+                                            samplesheet = samplesheet_merged, 
+                                            covar_df = covar_df,
+                                            batch_variable = "Batch")
+
+results_limma_tunedlambda1000_1.15 <- purrr::map_df(limma_tunedlambda1000_1.15_sig$Probe, 
+                            .f = results_lm, 
+                            samplesheet = samplesheet_merged, 
+                            covar_df = covar_df)
+
+leave_one_batch_out_results_limma_tunedlambda1000_1.15_maxP <- leave_one_batch_out_results_limma_tunedlambda1000_1.15 %>%
+  dplyr::group_by(Probe) %>%
+  dplyr::summarize(
+    leave_out_batch_maxp = leave_out_batch[which.max(p)],
+    maxp = max(p)
+  ) %>%
+  dplyr::left_join(results_limma_tunedlambda1000_1.15[,c("Probe", "p")] %>% dplyr::rename(p_allbatches = p), by="Probe")
+
+## Plots per CpG
+leave_one_out_batch_plots_limma_tunedlambda1000_1.15 <- purrr::map(unique(limma_tunedlambda1000_1.15_sig$Probe), 
+                                        .f = plot_leave_one_batch_out, 
+                                        stats = leave_one_batch_out_results_limma_tunedlambda1000_1.15, 
+                                        threshold = threshold,
+                                        text_size = text_size,
+                                        point_size = point_size
+                                        )
+names(leave_one_out_batch_plots_limma_tunedlambda1000_1.15) <- limma_tunedlambda1000_1.15_sig$Probe
+```
+
+
+Comparison p-value all data and least significant pvalue after leaving a batch out (showing 20 probes with largest differences):
+
+```{r,  fig.width = 10}
+diff_leave_one_batch_out_limma_tunedlambda1000_1.15 <- 
+leave_one_batch_out_results_limma_tunedlambda1000_1.15_maxP %>%
+  dplyr::filter(!Probe %in% excl_probes) %>% 
+  dplyr::rename(leave_batch_out = maxp, all_batches = p_allbatches) %>%
+  dplyr::mutate(diff = (-log10(all_batches)) - (-log10(leave_batch_out))) %>%
+  dplyr::arrange(desc(diff)) %>%
+  head(20) %>%
+  dplyr::mutate(Probe = factor(Probe, levels = unique(Probe))) %>%
+  dplyr::arrange(desc(diff)) %>%
+  tidyr::gather(key = "analysis", value = "pvalue", leave_batch_out, all_batches) %>%
+ggplot(aes(x = Probe, y = -log10(pvalue), col = leave_out_batch_maxp, shape = analysis)) +
+  geom_segment(
+    aes(x = Probe, xend = Probe, y = 0, yend = -log10(pvalue)), 
+    color = "lightgray"
+    ) + 
+  geom_point(aes(color = leave_out_batch_maxp), size = 3) +
+  colorblindr::scale_color_OkabeIto() +
+  ggpubr::theme_pubclean() +
+  theme(legend.position = "right"
+        ) +
+  guides(col=guide_legend(title="batch with largest effect")) +
+  ggtitle("leave-batch-out analyses") +
+  ylab(bquote(-log[10](italic(P)))) +
+  ggpubr::rotate_x_text(45)
+
+diff_leave_one_batch_out_limma_tunedlambda1000_1.15
+```
+
+### Leave-one-stratum-out
+
+```{r}
+leave_one_cohort_out_results_limma_tunedlambda1000_1.15 <- purrr::map_df(limma_tunedlambda1000_1.15_sig$Probe, 
+                                                  .f = leave_one_cohort_out, 
+                                                  samplesheet = samplesheet_merged, 
+                                                  covar_df =  covar_df,
+                                                  cohort_variable = "Study")
+
+leave_one_cohort_out_results_limma_tunedlambda1000_1.15_maxP <- leave_one_cohort_out_results_limma_tunedlambda1000_1.15 %>%
+  dplyr::group_by(Probe) %>%
+  dplyr::summarize(
+    leave_out_cohort_maxp = leave_out_cohort[which.max(p)],
+    maxp = max(p)
+  ) %>%
+  dplyr::left_join(results_limma_tunedlambda1000_1.15[,c("Probe", "p")] %>% dplyr::rename(p_allcohorts = p), by="Probe")
+
+leave_one_cohort_out_results_limma_tunedlambda1000_1.15_Qp <- leave_one_cohort_out_results_limma_tunedlambda1000_1.15 %>%
+  dplyr::filter(!is.na(Q.p)) %>%
+  dplyr::group_by(Probe) %>%
+  dplyr::summarize(
+    leave_out_cohort_max_Q.p = leave_out_cohort[which.max(Q.p)],
+    max_Q.p = max(Q.p),
+    leave_out_cohort_min_Q.p = leave_out_cohort[which.min(Q.p)],
+    min_Q.p = min(Q.p),
+  ) %>%
+  dplyr::left_join(results_limma_tunedlambda1000_1.15[,c("Probe", "Q.p")] %>% mutate(Q.p_original = Q.p), by="Probe")
+
+## Plots per CpG
+leave_one_out_cohort_plots_limma_tunedlambda1000_1.15 <- purrr::map(unique(limma_tunedlambda1000_1.15_sig$Probe), 
+                                        .f = plot_leave_one_cohort_out, 
+                                        stats = leave_one_cohort_out_results_limma_tunedlambda1000_1.15, 
+                                        threshold = threshold,
+                                        text_size = text_size,
+                                        point_size = point_size
+                                        )
+names(leave_one_out_cohort_plots_limma_tunedlambda1000_1.15) <- limma_tunedlambda1000_1.15_sig$Probe
+
+leave_one_out_cohort_plots_Qp_limma_tunedlambda1000_1.15 <- purrr::map(unique(limma_tunedlambda1000_1.15_sig$Probe), 
+                                        .f = plot_leave_one_cohort_out_Qp, 
+                                        stats = leave_one_cohort_out_results_limma_tunedlambda1000_1.15, 
+                                        text_size = text_size,
+                                        point_size = point_size
+                                        )
+names(leave_one_out_cohort_plots_Qp_limma_tunedlambda1000_1.15) <- limma_tunedlambda1000_1.15_sig$Probe
+```
+
+
+Comparison p-value all data and least significant pvalue after leaving a cohort out (showing 20 probes with largest differences):
+
+```{r, fig.width = 10}
+diff_leave_one_cohort_out_limma_tunedlambda1000_1.15 <- leave_one_cohort_out_results_limma_tunedlambda1000_1.15_maxP %>%
+  dplyr::filter(!Probe %in% excl_probes) %>%
+  dplyr::rename(leave_stratum_out = maxp, all_strata = p_allcohorts, leave_out_stratum_maxp = leave_out_cohort_maxp) %>%
+  dplyr::mutate(diff = (-log10(all_strata)) - (-log10(leave_stratum_out))) %>%
+  dplyr::arrange(desc(diff)) %>%
+  head(20) %>% 
+  dplyr::mutate(Probe = factor(Probe, levels = unique(Probe))) %>%
+  dplyr::arrange(desc(diff)) %>%
+  tidyr::gather(key = "analysis", value = "pvalue", leave_stratum_out, all_strata) %>%
+ggplot(aes(x = Probe, y = -log10(pvalue), col = leave_out_stratum_maxp, shape = analysis)) +
+  geom_segment(
+    aes(x = Probe, xend = Probe, y = 0, yend = -log10(pvalue)), 
+    color = "lightgray"
+    ) + 
+  geom_point(aes(color = leave_out_stratum_maxp), size = 3) +
+  colorblindr::scale_color_OkabeIto() +
+  ggpubr::theme_pubclean() +
+  theme(legend.position = "right"
+        ) +
+  guides(col=guide_legend(title="stratum with largest effect")) +
+  ggtitle("leave-stratum-out analyses") +
+  ylab(bquote(-log[10](italic(P)))) +
+  ggpubr::rotate_x_text(45)
+
+diff_leave_one_cohort_out_limma_tunedlambda1000_1.15
+```
