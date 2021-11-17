@@ -1,0 +1,327 @@
+---
+title: "incremental_R2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+```
+
+## R Markdown
+
+
+```{r get characterstics of the dataset}
+#get overview measured and predicted phenotypes nulldiftime
+
+for( i in colnames(measured_overview)){
+  outdplyr <- rlang::sym(i)
+  if(!grepl("alcohol|Alcohol|Smoking|smoking|cigarettes|Cigarettes|Glasses|BMI|C...Body.Mass.Index|Age|Sex", i)){
+mean_df[[i]] <-biomarker_finished_overview %>% filter(!is.na(!!outdplyr)) %>% dplyr::summarize(N= sum(!is.na(dif_sampling_date)),
+                                                                                               #Mean=mean(dif_sampling_date, na.rm = T),
+                                                                                               Min=round(min(dif_sampling_date, na.rm = T),3),
+                                                                                               Max=round(max(dif_sampling_date, na.rm = T),3),
+                                                                                               #Median=round(median(dif_sampling_date, na.rm = T),3),
+                                                                                               Median_iqr=qwraps2:::median_iqr(dif_sampling_date,  na_rm = T, show_n = "never"),
+                                                                                               mean_sd=qwraps2:::mean_sd(dif_sampling_date,  na_rm = T, denote_sd = "paren", show_n = "never"))
+} else {
+mean_df[[i]] <- biomarker_finished_overview %>% filter(!is.na(!!outdplyr)) %>% dplyr::summarize(N= sum(!is.na(dif_sampling_date_CRF)),
+                                                                                                 #Mean=round(mean(dif_sampling_date_CRF, na.rm = T),3),
+                                                                                                 Min=round(min(dif_sampling_date_CRF, na.rm = T),3),
+                                                                                                 Max=round(max(dif_sampling_date_CRF, na.rm = T),3),
+                                                                                                 #Median=round(median(dif_sampling_date_CRF, na.rm = T),3),
+                                                                                                 Median_iqr=qwraps2:::median_iqr(dif_sampling_date_CRF,  na_rm = T, show_n = "never"),
+                                                                                                 mean_sd=qwraps2:::mean_sd(dif_sampling_date_CRF,  na_rm = T, denote_sd = "paren", show_n = "never"))
+
+}
+} 
+
+```
+
+```{r get total and reduced R2, echo=FALSE}
+#test total R2: 
+
+#create dataframe with the names of the measured phenotypes in col1 and predicted phenotypes in col2
+
+test <- function (x){
+  outcome <- gsub("-.*", "", x)
+  variables_null <-  gsub(".*-", "", x)
+  
+  f_null <- as.formula(
+    paste(outcome, 
+          paste(variables_null, collapse = " + "), 
+          sep = " ~ "))
+  
+  outR <- matrix(ncol=2)
+  colnames(outR) <- c("total_R2","pheno")
+  outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+  outR[,2] <- paste(outcome,variables_null, sep="_" )
+  
+  outR %<>% as.data.frame()
+  outR
+} 
+
+output <- paste(tablephenotypes$Measured_phenotypes, tablephenotypes$Predicted_phenotypes, sep = "-")
+output <- output[-grep("NA_|-NA", output)]
+
+out <- purrr::map(output, .f=test)
+out %<>% bind_rows()
+
+saveRDS(out, file="total_R2.rds")
+
+
+#reduced R2 : 
+#add variables for null model:
+biomarker_finished_overview %<>% left_join(predicted_marioni %>% select(grep("PC", colnames(predicted_marioni)), Sample_Name))
+biomarker_finished_overview %>% select(grep(paste0("PC", seq(1:10), collapse = "|"), colnames(biomarker_finished_overview)))
+
+
+test_reduced <- function (x){
+  if (grepl("Mono|Gran", x)) {
+  outcome <- gsub("-.*", "", x)
+  variables_null <- c("caseControl_bin","predictedSex","Batch", "Predicted_Age_Zhang_EN",
+                       sprintf("PC%s_control", seq(1:30)))
+  
+  f_null <- as.formula(
+    paste(outcome, 
+          paste(variables_null, collapse = " + "), 
+          sep = " ~ "))
+  
+  outR <- matrix(ncol=2)
+  colnames(outR) <- c("reduced_R2","pheno")
+  outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$adj.r.squared,3)
+  outR[,2] <- outcome
+  
+  outR %<>% as.data.frame()
+  outR
+  } else if (grepl("Age", x)) {
+    outcome <- gsub("-.*", "", x)
+    variables_null <- c("caseControl_bin","predictedSex","Batch",colnames(biomarker_finished_overview %>%
+                                                                            select(grep("_Houseman", colnames(biomarker_finished_overview)))),
+                        sprintf("PC%s_control", seq(1:30)))
+    
+f_null <- as.formula(
+      paste(outcome, 
+            paste(variables_null, collapse = " + "), 
+            sep = " ~ "))
+    
+    outR <- matrix(ncol=2)
+    colnames(outR) <- c("reduced_R2","pheno")
+    outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$adj.r.squared,3)
+    outR[,2] <- outcome
+    
+    outR %<>% as.data.frame()
+    outR
+  } else {
+    outcome <- gsub("-.*", "", x)
+    
+variables_null <- c("caseControl_bin","predictedSex","Batch", "Predicted_Age_Zhang_EN",colnames(biomarker_finished_overview %>%
+                                                                                                      select(grep("_Houseman", colnames(biomarker_finished_overview)))),
+                    sprintf("PC%s_control", seq(1:30)))
+
+f_null <- as.formula(
+  paste(outcome, 
+        paste(variables_null, collapse = " + "), 
+        sep = " ~ "))
+
+outR <- matrix(ncol=2)
+colnames(outR) <- c("reduced_R2","pheno")
+outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$adj.r.squared,3)
+outR[,2] <- outcome
+
+outR %<>% as.data.frame()
+outR
+
+  }
+}
+  
+
+output <- paste(tablephenotypes$Measured_phenotypes, tablephenotypes$Predicted_phenotypes, sep = "-")
+output <- output[-grep("NA_|-NA", output)]
+
+out <- purrr::map(output[-13], .f=test_reduced)
+out %<>% bind_rows()
+
+saveRDS(out, file="reduced_R2.rds")
+
+
+```
+
+```{r get incremental R2, echo=FALSE}
+outR_output <- list()
+for (i in 1:length(tablephenotypes$Measured_phenotypes)) {
+  outcome <- tablephenotypes$Measured_phenotypes[i]
+  
+  if(grepl("Age",tablephenotypes$Measured_phenotypes[i])) {
+    
+    variables_null <- c("caseControl_bin","predictedSex","Batch",colnames(biomarker_finished_overview %>%
+                                                                            select(grep("_Epidish", colnames(biomarker_finished_overview)))),
+                        sprintf("PC%s_control", seq(1:30)))
+    
+    f_null <- as.formula(
+      paste(outcome, 
+            paste(variables_null, collapse = " + "), 
+            sep = " ~ "))
+    
+    outR <- matrix(ncol=6)
+    colnames(outR) <- c("r.squared_NULL","adj.r.squared_NULL", "Measured_phenotypes", "r.squared_pheno", "adj.r.squared_pheno", "incremental_R")
+    outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+    outR[,2] <- round(summary(lm(f_null, biomarker_finished_overview))$adj.r.squared,3)
+    outR[,3] <- tablephenotypes$Predicted_phenotypes[i]
+    
+    
+    variables_pheno <-  c(tablephenotypes$Predicted_phenotypes[i], "caseControl_bin","predictedSex" , "Batch" ,colnames(biomarker_finished_overview %>%
+                                                                                                                          select(grep("_Epidish", colnames(biomarker_finished_overview)))),
+                          sprintf("PC%s_control", seq(1:30)))
+    
+    
+    
+    f_pheno <- as.formula(
+      paste(outcome, 
+            paste(variables_pheno, collapse = " + "), 
+            sep = " ~ "))
+    
+    outR[,4] <- round(summary(lm(f_pheno, biomarker_finished_overview))$r.squared,3)
+    outR[,5] <- round(summary(lm(f_pheno, biomarker_finished_overview))$adj.r.squared,3)
+    outR[,6] <- round(summary(lm(f_pheno, biomarker_finished_overview))$r.squared -  summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+    outR_output[[i]] <- outR
+    
+  }else if (grepl("Cigarettes|Alcohol|alcohol", tablephenotypes$Measured_phenotypes[i])){
+       input<- ifelse(grepl("Cigarettes",  tablephenotypes$Measured_phenotypes[i]), "Pack_years_total_measured", "Units_Alcohol_measured" )
+        biomarker_finished_overview_sub[[input]] <- ifelse( biomarker_finished_overview_sub[[input]] == 0, NA_integer_,  biomarker_finished_overview_sub[[input]])
+        variables_null <- c("caseControl_bin","predictedSex","Batch", "Predicted_Age_Zhang_EN",colnames(biomarker_finished_overview %>%
+                                                                                                          select(grep("_Epidish", colnames(biomarker_finished_overview)))),
+                            sprintf("PC%s_control", seq(1:30)))
+        
+        f_null <- as.formula(
+          paste(outcome, 
+                paste(variables_null, collapse = " + "), 
+                sep = " ~ "))
+        
+        outR <- matrix(ncol=6)
+        colnames(outR) <- c("r.squared_NULL","adj.r.squared_NULL", "Measured_phenotypes", "r.squared_pheno", "adj.r.squared_pheno", "incremental_R")
+        outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview_sub))$r.squared,3)
+        outR[,2] <- round(summary(lm(f_null, biomarker_finished_overview_sub))$adj.r.squared,3)
+        outR[,3] <- tablephenotypes$Predicted_phenotypes[i]
+        
+        
+        variables_pheno <-  c(tablephenotypes$Predicted_phenotypes[i], "caseControl_bin","predictedSex" , "Batch", "Predicted_Age_Zhang_EN" ,colnames(biomarker_finished_overview %>%
+                                                                                                                                                        select(grep("_Epidish", colnames(biomarker_finished_overview)))),
+                              sprintf("PC%s_control", seq(1:30)))
+        
+        
+        
+        f_pheno <- as.formula(
+          paste(outcome, 
+                paste(variables_pheno, collapse = " + "), 
+                sep = " ~ "))
+        
+        outR[,4] <- round(summary(lm(f_pheno, biomarker_finished_overview_sub))$r.squared,3)
+        outR[,5] <- round(summary(lm(f_pheno, biomarker_finished_overview_sub))$adj.r.squared,3)
+        outR[,6] <- round(summary(lm(f_pheno, biomarker_finished_overview_sub))$r.squared -  summary(lm(f_null, biomarker_finished_overview_sub))$r.squared,3)
+        outR_output[[i]] <- outR
+        
+  }else if (grepl("Mono|Gran",  tablephenotypes$Measured_phenotypes[i])){
+    variables_null <- c("caseControl_bin","predictedSex","Batch", "Predicted_Age_Zhang_EN",
+                        sprintf("PC%s_control", seq(1:30)))
+    
+    f_null <- as.formula(
+      paste(outcome, 
+            paste(variables_null, collapse = " + "), 
+            sep = " ~ "))
+    
+    outR <- matrix(ncol=6)
+    colnames(outR) <- c("r.squared_NULL","adj.r.squared_NULL", "Measured_phenotypes", "r.squared_pheno", "adj.r.squared_pheno", "incremental_R")
+    outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+    outR[,2] <- round(summary(lm(f_null, biomarker_finished_overview))$adj.r.squared,3)
+    outR[,3] <- tablephenotypes$Predicted_phenotypes[i]
+    
+    
+    variables_pheno <-  c(tablephenotypes$Predicted_phenotypes[i], "caseControl_bin","predictedSex" , "Batch", "Predicted_Age_Zhang_EN" ,
+                          sprintf("PC%s_control", seq(1:30)))
+    
+    
+    
+    f_pheno <- as.formula(
+      paste(outcome, 
+            paste(variables_pheno, collapse = " + "), 
+            sep = " ~ "))
+    
+    outR[,4] <- round(summary(lm(f_pheno, biomarker_finished_overview))$r.squared,3)
+    outR[,5] <- round(summary(lm(f_pheno, biomarker_finished_overview))$adj.r.squared,3)
+    outR[,6] <- round(summary(lm(f_pheno, biomarker_finished_overview))$r.squared -  summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+    outR_output[[i]] <- outR
+   }else{
+      variables_null <- c("caseControl_bin","predictedSex","Batch", "Predicted_Age_Zhang_EN",colnames(biomarker_finished_overview %>%
+                                                                                                        select(grep("_Epidish", colnames(biomarker_finished_overview)))),
+                          sprintf("PC%s_control", seq(1:30)))
+      
+      f_null <- as.formula(
+        paste(outcome, 
+              paste(variables_null, collapse = " + "), 
+              sep = " ~ "))
+      
+      outR <- matrix(ncol=6)
+      colnames(outR) <- c("r.squared_NULL","adj.r.squared_NULL", "Measured_phenotypes", "r.squared_pheno", "adj.r.squared_pheno", "incremental_R")
+      outR[,1] <- round(summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+      outR[,2] <- round(summary(lm(f_null, biomarker_finished_overview))$adj.r.squared,3)
+      outR[,3] <- tablephenotypes$Predicted_phenotypes[i]
+      
+      
+      variables_pheno <-  c(tablephenotypes$Predicted_phenotypes[i], "caseControl_bin","predictedSex" , "Batch", "Predicted_Age_Zhang_EN" ,colnames(biomarker_finished_overview %>%
+                                                                                                                                                      select(grep("_Epidish", colnames(biomarker_finished_overview)))),
+                            sprintf("PC%s_control", seq(1:30)))
+      
+      
+      
+      f_pheno <- as.formula(
+        paste(outcome, 
+              paste(variables_pheno, collapse = " + "), 
+              sep = " ~ "))
+      
+      outR[,4] <- round(summary(lm(f_pheno, biomarker_finished_overview))$r.squared,3)
+      outR[,5] <- round(summary(lm(f_pheno, biomarker_finished_overview))$adj.r.squared,3)
+      outR[,6] <- round(summary(lm(f_pheno, biomarker_finished_overview))$r.squared -  summary(lm(f_null, biomarker_finished_overview))$r.squared,3)
+      outR_output[[i]] <- outR
+      }
+  
+  }
+  
+
+result_incrementalR <- do.call(rbind,outR_output)
+result_incrementalR <- as_tibble(result_incrementalR)
+
+write.table(result_incrementalR, file="/results_incremental_R_nulltime.txt", col.names = T, sep="\t",
+            row.names=F, quote=F)
+
+
+```
+
+```{r plot predicted and measured phenotypes}
+biomarker_finished_overview_sub <- (biomarker_finished_overview)
+for(i in 1:length(tablephenotypes$Measured_phenotypes)) {
+  if(grepl("Cigarettes|Alcohol", tablephenotypes$Measured_phenotypes[i])){
+    input<- ifelse(grepl("Cigarettes",  tablephenotypes$Measured_phenotypes[i]), "Pack_years_total_measured", "Units_Alcohol_measured" )
+    biomarker_finished_overview_sub[[input]] <- ifelse( biomarker_finished_overview_sub[[input]] == 0, NA_integer_,  biomarker_finished_overview_sub[[input]])
+     plist[[i]] <- ggplot(biomarker_finished_overview_sub, aes_string(x=input, y=tablephenotypes$Predicted_phenotypes[i])) + geom_point(size=0.25) + theme_bw() + 
+      annotate(geom="text", x=Inf, y=-Inf, label=paste(colnames(outR)[c(4,6)], outR_output[[i]][c(4,6)], collapse = " \n ", sep="="),vjust=-1, hjust=1, size=1.5, colour="blue") + 
+      theme( axis.text=element_text(size=rel(0.25)), axis.title = element_text(size=rel(0.5))) #axis.text.x=element_text(size=rel(20)),axis.text.y =element_text(size=rel(1))
+    
+  }else{
+   plist[[i]] <- ggplot(biomarker_finished_overview_sub, aes_string(x=tablephenotypes$Measured_phenotypes[i], y=tablephenotypes$Predicted_phenotypes[i])) + geom_point(size=0.25) + theme_bw() + 
+      annotate(geom="text", x=Inf, y=-Inf, label=paste(colnames(outR)[c(4,6)], outR_output[[i]][c(4,6)], collapse = " \n ", sep="="),vjust=-1, hjust=1, size=1.5, colour="blue") + 
+      theme( axis.text=element_text(size=rel(0.25)), axis.title = element_text(size=rel(0.5))) #axis.text.x=element_text(size=rel(20)),axis.text.y =element_text(size=rel(1))
+  }
+}
+
+
+library(gridExtra) 
+n <- length(plist)
+#nCol <- floor(sqrt(n))
+do.call("grid.arrange", c(plist, ncol=2))
+ggsave(file = "predicted_measured_phenotypes_corplots_nullmodel_mintime.pdf", arrangeGrob(grobs = plist, ncol = 2))  ## save plot
+
+
+```
+
+
+#no ROC curve included --> how to 

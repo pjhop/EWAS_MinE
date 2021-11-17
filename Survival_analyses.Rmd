@@ -1,0 +1,233 @@
+---
+title: "survival_analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(flexsurv)
+library(survival)
+library(survminer)
+library(magrittr)
+library(dplyr)
+library(gridExtra)
+library(tidyverse)
+library(magrittr)
+```
+
+## subset survival data
+
+```{r data}
+samplesheet <- readRDS("samplesheet_merged_survival_incl_alive_betas.rds")
+samplesheet %<>% group_by(Batch) %>% mutate(percentage= round(sum(Survival_status=="dead",na.rm=TRUE)/dplyr::n() * 100),2) %>% ungroup()
+
+```
+
+## Perform cox
+main model:
+
+```{r Cox main, echo=FALSE}
+cox_450k_main <- function(site, samplesheet){
+     print(site)
+variables <- paste(site, "Gran", "Mono", "CD8T" , "CD4T", "NK", "Sex", "Predicted_Age_Zhang_EN", sep = " + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:30), "_control"), collapse=" + "), sep=" + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:30), "_res"), collapse=" + "), sep=" + ")
+variables  <- paste(variables, "Batch", sep=" + ")
+
+f_null <- as.formula(paste("Surv(Survival_months, Survival_status_bin)", variables, sep=" ~ "))
+
+
+r <- tryCatch({
+cox <- coxph(f_null, data=samplesheet %>% filter(Study == "mine_450k") %>% filter(Survival_months != 0), tt = function(x, t,...) x * log(t))
+}, warning = function(w) {
+return(list(error_text = trimws(paste0("WARNING: ", w))))
+}, error = function(e) {
+return(list(error_text = trimws(paste0("ERROR: ", e))))
+}, finally = {
+# this will execute no matter what else happened
+})
+
+
+if(exists("cox")){
+#check assumtions with strata:
+plot_forest <- forestmodel::forest_model(cox, covariates=c(site, "Gran", "Mono", "CD8T" , "CD4T", "NK","Sex", "Predicted_Age_Zhang_EN"))
+ggsave(plot_forest,file=sprintf("/hpc/hers_en/rzwamborn/Phenotypes/Cox/hits_moalimma_45/final_models/figures/forest_%s_450k_main.png", site))
+
+}
+
+if(exists("cox")){
+res <- summary(cox) #output provides HR CIs
+res_out <- tibble(site=site, coefficients=res$coefficients[,2][[1]],conf.int=paste0(round(res$conf.int[1,3],2), "-", round(res$conf.int[1,4], 2)),upper=res$conf.int[1,4],
+lower=res$conf.int[1,3], error=ifelse(length(r) == 1 , r[[1]], "no_error/warning"))
+
+} else {
+res_out <- tibble(site=site, coefficients=NA,conf.int=NA,upper=NA, lower=NA, error=ifelse(length(r) == 1 , r[[1]], "no_error/warning"), schoenfeld="no shoenfeld variables")
+
+}
+
+res_out
+
+}
+
+cox_epic_main <- function(site, samplesheet){
+     print(site)
+variables <- paste(site, "Gran", "Mono", "CD8T" , "CD4T", "NK", "Sex", "Predicted_Age_Zhang_EN", sep = " + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:30), "_control"), collapse=" + "), sep=" + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:15), "_res"), collapse=" + "), sep=" + ")
+variables  <- paste(variables, "Batch", sep=" + ")
+
+f_null <- as.formula(paste("Surv(Survival_months, Survival_status_bin)", variables, sep=" ~ "))
+
+
+r <- tryCatch({
+ cox <- coxph(f_null, data=samplesheet %>% filter(Study == "mine_epic") %>% filter(Survival_months != 0), tt = function(x, t,...) x * log(t))
+
+}, warning = function(w) {
+return(list(error_text = trimws(paste0("WARNING: ", w))))
+}, error = function(e) {
+return(list(error_text = trimws(paste0("ERROR: ", e))))
+}, finally = {
+# this will execute no matter what else happened
+})
+
+
+if(exists("cox")){
+#check assumtions with strata:
+plot_forest <- forestmodel::forest_model(cox, covariates=c(site, "Gran", "Mono", "CD8T" , "CD4T", "NK","Sex", "Predicted_Age_Zhang_EN"))
+ggsave(plot_forest,file=sprintf("/hpc/hers_en/rzwamborn/Phenotypes/Cox/hits_moalimma_45/final_models/figures/forest_%s_epic_main.png", site))
+}
+
+if(exists("cox")){
+res <- summary(cox) #output provides HR CIs
+res_out <- tibble(site=site, coefficients=res$coefficients[,2][[1]],conf.int=paste0(round(res$conf.int[1,3],2), "-", round(res$conf.int[1,4], 2)),upper=res$conf.int[1,4],
+lower=res$conf.int[1,3], error=ifelse(length(r) == 1 , r[[1]], "no_error/warning"))
+
+} else {
+res_out <- tibble(site=site, coefficients=NA,conf.int=NA,upper=NA, lower=NA, error=ifelse(length(r) == 1 , r[[1]], "no_error/warning"))
+
+}
+
+res_out
+
+}
+
+cox_reg_450k_main <- purrr::map(colnames(samplesheet %>% dplyr::select(grep("^cg", colnames(samplesheet)))), .f = cox_450k_main, samplesheet=samplesheet %>% filter(percentage >= 30))
+cox_reg_epic_main <- purrr::map(colnames(samplesheet %>% dplyr::select(grep("^cg", colnames(samplesheet)))), .f = cox_epic_main, samplesheet=samplesheet %>% filter(percentage >= 30))
+
+
+```
+
+For stratified cox add batch to variables:
+variables  <- paste(variables, "strata(Batch)", sep=" + ")
+
+time component:
+cox <- coxph(f_null, data=samplesheet %>% filter(Study == "mine_epic") %>% filter(Survival_months != 0), tt = function(x, t,...) x * log(t))
+
+
+```{r Royston}
+library(flexsurv)
+library(survival)
+library(survminer)
+library(magrittr)
+library(dplyr)
+library(gridExtra)
+
+samplesheet <- readRDS("/hpc/hers_en/shared/paul_ramona/samplesheet_merged_survival_incl_alive_betas.rds")
+samplesheet$Survival_status_bin <- ifelse(samplesheet$Survival_status == "dead", 1, 0)
+
+#filter on %dead
+samplesheet %<>% group_by(Batch) %>% mutate(percentage= round(sum(Survival_status=="dead",na.rm=TRUE)/dplyr::n() * 100),2) %>% ungroup()
+dim(samplesheet %>% filter(percentage >= 30)) #5403
+
+dim(samplesheet %>% filter(percentage >= 30 & !is.na(Survival_status_bin)))
+dim(samplesheet %>% filter(percentage >= 30 & !is.na(Survival_months) & !is.na(Survival_status) & !is.na(Sex))) 
+
+
+royston_450k <- function(site, samplesheet){
+     print(site)
+variables <- paste(site, "Batch", "Gran", "Mono", "CD8T" , "CD4T", "NK", "Sex", "Predicted_Age_Zhang_EN", sep = " + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:30), "_control"), collapse=" + "), sep=" + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:30), "_res"), collapse=" + "), sep=" + ")
+
+f_null <- as.formula(paste("Surv(Survival_months, Survival_status_bin)", variables, sep=" ~ "))
+
+checkvalues <- c("Batch", "Gran", "Mono", "CD8T" , "CD4T", "NK", "Sex", "Predicted_Age_Zhang_EN", paste0("PC"  ,seq(1:30), "_control"),paste0("PC"  ,seq(1:30), "_res"),"Survival_status_bin", site)
+
+
+r <- tryCatch({
+out <- flexsurvspline(f_null, data=samplesheet %>% filter(Study == "mine_450k") %>% filter(Survival_months != 0), k = 1, scale = "hazard")
+}, warning = function(w) {
+return(list(error_text = trimws(paste0("WARNING: ", w))))
+}, error = function(e) {
+return(list(error_text = trimws(paste0("ERROR: ", e))))
+}, finally = {
+# this will execute no matter what else happened
+})
+
+
+if(exists("out")){
+#check assumtions with strata:
+xx = data.table::as.data.table(out$res.t) 
+ xx[,cov := rownames(out$res.t)]
+ xx[,z:=-est/se][,pval:=2*pnorm(-abs(z))]
+ out$dt = xx
+
+} else{
+     out <- data.frame(Probe=site, note="No royston parmar performed")
+}
+
+out
+
+}
+
+out_royston <- purrr::map(colnames(samplesheet %>% select(grep("cg", colnames(samplesheet)))), .f=royston_450k, samplesheet= samplesheet %>% filter(percentage >= 30))
+saveRDS(out_royston, file="royston_parmar_test_450k_hazard.rds")
+
+###############
+#EPIC
+royston_epic <- function(site, samplesheet){
+     print(site)
+variables <- paste(site, "Batch", "Gran", "Mono", "CD8T" , "CD4T", "NK", "Sex", "Predicted_Age_Zhang_EN", sep = " + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:30), "_control"), collapse=" + "), sep=" + ")
+variables  <- paste(variables, paste(paste0("PC"  ,seq(1:15), "_res"), collapse=" + "), sep=" + ")
+
+f_null <- as.formula(paste("Surv(Survival_months, Survival_status_bin)", variables, sep=" ~ "))
+
+checkvalues <- c("Batch", "Gran", "Mono", "CD8T" , "CD4T", "NK", "Sex", "Predicted_Age_Zhang_EN", paste0("PC"  ,seq(1:30), "_control"),paste0("PC"  ,seq(1:30), "_res"),"Survival_status_bin", site)
+
+
+r <- tryCatch({
+out <- flexsurvspline(f_null, data=samplesheet %>% filter(Study == "mine_epic") %>% filter(Survival_months != 0), k = 1, scale = "hazard")
+}, warning = function(w) {
+return(list(error_text = trimws(paste0("WARNING: ", w))))
+}, error = function(e) {
+return(list(error_text = trimws(paste0("ERROR: ", e))))
+}, finally = {
+# this will execute no matter what else happened
+})
+
+
+if(exists("out")){
+#check assumtions with strata:
+xx = data.table::as.data.table(out$res.t) #used odds before so different scale
+ xx[,cov := rownames(out$res.t)]
+ xx[,z:=-est/se][,pval:=2*pnorm(-abs(z))]
+ out$dt = xx
+
+} else{
+     out <- data.frame(Probe=site, note="No royston parmar performed")
+}
+
+out
+
+}
+
+#output is hazard --> the hazards ratio associated with a predictor variable is given by the exponent of its coefficient (exp(coef)) --> so do not use log in meta
+
+out_royston_epic <- purrr::map(colnames(samplesheet %>% select(grep("cg", colnames(samplesheet)))), .f=royston_epic, samplesheet= samplesheet %>% filter(percentage >= 30))
+saveRDS(out_royston_epic, file="final_models/royston_parmar_test_epic_hazard.rds")
+
+
+```
+
+
+#did not add meta.. and only main cox with coxph..the rest is only small adjustments?
