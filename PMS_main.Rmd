@@ -1,0 +1,2124 @@
+---
+title: "PMS analyses"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, warning=FALSE, message = FALSE, dev = "png")
+```
+
+```{r, cache = FALSE}
+## Libraries
+library(tidyverse)
+library(magrittr)
+library(stringi)
+library(ggpubr)
+library(gt)
+library(survival)
+library(flexsurv)
+library(ggrepel)
+```
+
+```{r, cache = FALSE}
+set.seed(10)
+text_size=12
+point_size=2.5
+
+## for saving
+text_size = 9
+point_size = 1
+point_size_highlight=1
+
+load("prepared_data_PMS.rda")
+```
+
+
+# Analyses
+
+## Case/con analyses
+
+### Functions
+
+```{r, include = FALSE}
+## Functions ------------------------------------------------------
+
+# Run linear model + meta-analysis
+results_lm <- function(outcome, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_lm_per_study, outcome = outcome, covar_df = covar_df, samplesheet = samplesheet)
+  covar <- stringr::str_split(stats$covar, pattern = ",") %>% unlist() %>% unique()
+  stats_meta <- meta_analysis(stats, outcome = outcome)
+  stats_meta$sample_size <- nrow(samplesheet)
+  stats_meta <- stats_meta %>% dplyr::select(Outcome, sample_size, dplyr::everything()) %>%
+    dplyr::mutate(covar = paste(covar, collapse = ","))
+}
+
+# Run linear model, output test statistics per cohort
+results_lm_per_study <- function(outcome, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_lm_per_study, outcome = outcome, covar_df = covar_df, samplesheet = samplesheet)
+}
+
+# Run linear model per cohort
+run_lm_per_study <- function(study, outcome, covar_df, samplesheet) {
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[outcome]]))) {
+    covar <- covar_df[[study]]
+    samplesheet_temp <- samplesheet %>% dplyr::filter(Study == study)
+    check <- colSums(!is.na(samplesheet_temp[,covar]))
+    covar <- covar[check!=0]
+    covar <- covar[covar != outcome]
+    nr_samples <- sum(complete.cases(samplesheet_temp[,covar, drop = FALSE]))
+    formula <- as.formula(sprintf("%s ~ caseControl_bin + %s", outcome, paste(covar, collapse = "+")))
+    model <- lm(formula, data = samplesheet %>% dplyr::filter(Study == study))
+    tibble(Outcome = outcome, Study = study, b = summary(model)$coef["caseControl_bin",1], se = summary(model)$coef["caseControl_bin",2], t = summary(model)$coef["caseControl_bin",3], p = summary(model)$coef["caseControl_bin",4])
+  } else {
+    NULL
+  }
+}
+
+# Run logistic regression + meta-analysis
+results_glm <- function(outcome, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_glm_per_study, outcome = outcome, covar_df = covar_df, samplesheet = samplesheet)
+  covar <- stringr::str_split(stats$covar, pattern = ",") %>% unlist() %>% unique()
+  stats_meta <- meta_analysis(stats, outcome = outcome)
+  stats_meta$sample_size <- sum(stats$sample_size)
+  stats_meta <- stats_meta %>% 
+    dplyr::select(Outcome, sample_size, b, se, dplyr::everything()) %>%
+    dplyr::mutate(covar = paste(covar, collapse = ","))
+}
+
+# Run logistic regression, output test statistics per cohort
+results_glm_per_study <- function(outcome, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_glm_per_study, outcome = outcome, covar_df = covar_df, samplesheet = samplesheet)
+}
+
+# Run logistic regression per cohort
+run_glm_per_study <- function(study, outcome, covar_df, samplesheet) {
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[outcome]]))) {
+    covar <- covar_df[[study]]
+    samplesheet_temp <- samplesheet %>% dplyr::filter(Study == study)
+    check <- colSums(!is.na(samplesheet_temp[,covar]))
+    covar <- covar[check!=0]
+    covar <- covar[covar != outcome]
+    nr_samples <- sum(complete.cases(samplesheet_temp[,covar, drop = FALSE]))
+    formula <- as.formula(sprintf("caseControl_bin ~ %s + %s", outcome, paste(covar, collapse = "+")))
+    model <- glm(formula, data = samplesheet %>% dplyr::filter(Study == study), family = "binomial")
+    tibble(Outcome = outcome, Study = study, b = summary(model)$coef[outcome,1], se = summary(model)$coef[outcome,2], t = summary(model)$coef[outcome,3], p = summary(model)$coef[outcome,4], sample_size = nr_samples, covar = paste(covar, collapse = ","))
+  } else {
+    NULL
+  }
+}
+
+# Meta-analysis
+meta_analysis <- function(stats, outcome) {
+  b <- stats$b
+  se <- stats$se
+  met <- meta::metagen(TE = b, seTE = se,
+                       studlab = stats$Study)
+  tibble::tibble(Outcome = outcome, b = met$TE.fixed, se = met$seTE.fixed, p = met$pval.fixed,
+                 lower.fixed = met$lower.fixed, upper.fixed = met$upper.fixed,
+                 b_random = met$TE.random, se_random = met$seTE.random, p_random = met$pval.random,
+                 lower.random = met$lower.random, upper.random = met$upper.random,
+                 Q = met$Q, Q.p = met$pval.Q)
+}
+
+## Cumulatively adds PCs to logistic model
+results_glm_addPC_meta <- function(nPCs, outcome, samplesheet, covar_df_base) {
+  covar_df <- list(
+    mine_450k = c(covar_df_base[["mine_450k"]], paste0("PC", 1:nPCs, "_res")),
+    mine_epic = c(covar_df_base[["mine_epic"]], paste0("PC", 1:nPCs, "_res")),
+    AUS_batch1 = c(covar_df_base[["AUS_batch1"]], paste0("PC", 1:nPCs, "_res")),
+    AUS_batch2 = c(covar_df_base[["AUS_batch2"]], paste0("PC", 1:nPCs, "_res"))
+  )
+  results <- results_glm_per_study(outcome = outcome, samplesheet = samplesheet, covar_df = covar_df) %>% dplyr::mutate(nPCs = nPCs)
+  PCs <- unique(results$nPCs)
+  covar <- stringr::str_split(results$covar, pattern = ",") %>% unlist() %>% unique()
+  results_meta <- purrr::map_df(PCs, .f = function(PC, results, outcome) {results_ <- results %>% dplyr::filter(nPCs == PC); meta_analysis(results_, outcome = outcome) %>% dplyr::mutate(nPCs = PC)}, results = results, outcome = outcome)
+  results_meta$covar <- paste(covar, collapse=",")
+  results_meta
+}
+
+
+results_glm_addPC_incremental_meta <- function(outcome, samplesheet, covar_df, PC_range) {
+  stats <- purrr::map_df(
+    PC_range,
+    .f = results_glm_addPC_meta,
+    outcome = outcome,
+    samplesheet = samplesheet,
+     covar_df_base = covar_df
+  )
+  stats
+}
+
+## Iteratively add covariates to logistic regression
+results_glm_addcovars <- function(outcome, samplesheet, covars, covar_df) {
+  purrr::map_df(covars, .f = results_glm_addcovar, outcome = outcome, samplesheet=samplesheet, covar_df_base = covar_df)
+}
+
+results_glm_addcovar <- function(covar, outcome, samplesheet, covar_df_base) {
+  covar_df <- list(
+    mine_450k = c(covar_df_base[["mine_450k"]], covar),
+    mine_epic = c(covar_df_base[["mine_epic"]], covar),
+    AUS_batch1 = c(covar_df_base[["AUS_batch1"]], covar),
+    AUS_batch2 = c(covar_df_base[["AUS_batch2"]], covar)
+  )
+  results <- results_glm(outcome, samplesheet = samplesheet, covar_df = covar_df) 
+  results$add_covar <- covar
+  results
+}
+```
+
+
+### Analyses
+
+```{r, include = FALSE}
+## Main predictors
+main_predictors <- c("smokingScore_Elliot", "dnamalc.144cpg_Liu", "BMI_Hamilton", "CRP_Ligthart", "HDLchol_McCartney", "Predicted_Age_Zhang_EN", "CD4T", "CD8T", "Mono", "Gran", "NK", "B", gadd_predictors)
+predictors_test <- main_predictors
+all_predictors <- c(main_predictors,"PEth_Liang", "dnamalc.5cpg_Liu", "dnamalc.23cpg_Liu", "dnamalc.78cpg_Liu", "alcohol_McCartney", "smoking_McCartney", "BMI_McCartney", "totalchol_McCartney", "LDLchol_McCartney", "Predicted_Age_Horvath", "Predicted_Age_Hannum")
+wbc <- c("CD4T", "CD8T", "Mono", "Gran", "NK", "B")
+threshold_predictors <- 0.05/length(main_predictors)
+
+## Models ----------------------------------------------------------------------
+
+## Core model: Predicted Age, Sex, Batch, cellcounts 30 control PCs
+covar_df_core_30controlPCs <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))
+)
+
+covar_df_core_30controlPCs_noWBC <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")))
+
+## Core model + all predictors
+covar_df_allpredictors <- list(
+  mine_450k = unique(c(predictors_test, "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))),
+  mine_epic = unique(c(predictors_test, "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))),
+  AUS_batch1 = unique(c(predictors_test, "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))),
+  AUS_batch2 = unique(c(predictors_test, "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")))
+)
+
+covar_df_allpredictors_noWBC <- list(
+  mine_450k = c(predictors_test[!predictors_test %in% wbc], "Sex", "Batch", paste0("PC", 1:30, "_control")),
+  mine_epic = c(predictors_test[!predictors_test %in% wbc], "Sex", "Batch", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c(predictors_test[!predictors_test %in% wbc], "Sex", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c(predictors_test[!predictors_test %in% wbc], "Sex", paste0("PC", 1:30, "_control"))
+)
+
+## Fine-tuned model (LB)
+covar_df_finetuned <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+covar_df_finetuned_allpredictors <- list(
+  mine_450k = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"],"Predicted_Age_Zhang_EN", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"],"Predicted_Age_Zhang_EN", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"],"Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"],"Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+covar_df_finetuned_noWBC <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control"), paste0("PC", 1:30)),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control"), paste0("PC", 1:15)),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control"), paste0("PC", 1:25)),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control"), paste0("PC", 1:30))
+)
+
+covar_df_finetuned_allpredictors_noWBC <- list(
+  mine_450k = c(predictors_test[!predictors_test %in% c("Predicted_Age_Zhang_EN", wbc)], "Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control"), paste0("PC", 1:30)),
+  mine_epic = c(predictors_test[!predictors_test %in% c("Predicted_Age_Zhang_EN", wbc)],"Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control"), paste0("PC", 1:15)),
+  AUS_batch1 = c(predictors_test[!predictors_test %in% c("Predicted_Age_Zhang_EN", wbc)],"Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control"), paste0("PC", 1:25)),
+  AUS_batch2 = c(predictors_test[!predictors_test %in% c("Predicted_Age_Zhang_EN", wbc)],"Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control"), paste0("PC", 1:30))
+)
+
+## covars for Age Acceleration -> chronological age is added to the model
+covar_df_core_30controlPCs_Age <- list(
+  mine_450k = c("Age", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  mine_epic = c("Age", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("Age","Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("Age", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))
+)
+
+covar_df_allpredictors_Age <- list(
+  mine_450k = unique(c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))),
+  mine_epic = unique(c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))),
+  AUS_batch1 = unique(c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))),
+  AUS_batch2 = unique(c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")))
+)
+
+covar_df_finetuned_Age <- list(
+  mine_450k = c( "Age", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c( "Age", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c( "Age", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c( "Age", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+covar_df_finetuned_allpredictors_Age <- list(
+  mine_450k = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c(predictors_test[predictors_test != "Predicted_Age_Zhang_EN"], "Age", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+
+## Core model -----------------------------------------------
+stats_core_model <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_core_30controlPCs
+)
+
+stats_core_model_age <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_core_30controlPCs_Age
+)
+
+stats_core_model_wbc <- purrr::map_df(
+  c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc,
+  covar_df = covar_df_core_30controlPCs_noWBC
+)
+
+stats_core_model <- dplyr::bind_rows(
+  stats_core_model,
+  stats_core_model_age,
+  stats_core_model_wbc
+  )
+
+## Core model + all predictors -----------------------------------
+
+stats_core_model_all_predictors <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_allpredictors
+)
+
+stats_core_model_all_predictors_age <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_allpredictors_Age
+)
+
+stats_core_model_all_predictors_wbc <- purrr::map_df(
+  c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc,
+  covar_df = covar_df_allpredictors_noWBC
+)
+
+stats_core_model_all_predictors <- dplyr::bind_rows(
+  stats_core_model_all_predictors,
+  stats_core_model_all_predictors_age,
+  stats_core_model_all_predictors_wbc
+  )
+
+
+## Fine-tuned (LB) model ---------------------------------------------------------
+stats_fine_tuned <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_finetuned
+)
+
+stats_finetuned_age <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age  %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_finetuned_Age
+)
+
+stats_finetuned_wbc <- purrr::map_df(
+  c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc,
+  covar_df = covar_df_finetuned_noWBC
+)
+
+stats_fine_tuned <- dplyr::bind_rows(
+  stats_fine_tuned,
+  stats_finetuned_age,
+  stats_finetuned_wbc
+  )
+
+## Add all tested predictors
+stats_finetuned_all_predictors <- purrr::map_df(
+  predictors_test[!predictors_test %in% c("Predicted_Age_Zhang_EN", wbc)],
+  .f = results_glm,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_finetuned_allpredictors
+)
+
+stats_finetuned_all_predictors_age <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_finetuned_allpredictors_Age
+)
+
+stats_finetuned_all_predictors_wbc <- purrr::map_df(
+   c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+   .f = results_glm,
+   samplesheet = samplesheet_merged_wbc,
+   covar_df = covar_df_finetuned_allpredictors_noWBC
+ )
+
+stats_fine_tuned_all_predictors <- dplyr::bind_rows(
+   stats_finetuned_all_predictors,
+   stats_finetuned_all_predictors_age,
+   stats_finetuned_all_predictors_wbc
+   )
+
+### Cumulatively add PCs -----------------------------------
+
+stats_core_model_incrementalPCs <- purrr::map_df(
+   all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f  = results_glm_addPC_incremental_meta,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_core_30controlPCs,
+  PC_range = 1:30
+)
+
+stats_core_model_incrementalPCs_Age <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f  = results_glm_addPC_incremental_meta,
+  samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_core_30controlPCs_Age,
+  PC_range = 1:30
+)
+
+results_glm_addPC_meta_wbc <- function(nPCs, outcome, samplesheet, covar_df_base) {
+  covar_df <- list(
+    mine_450k = c(covar_df_base[["mine_450k"]], paste0("PC", 1:nPCs)),
+    mine_epic = c(covar_df_base[["mine_epic"]], paste0("PC", 1:nPCs)),
+    AUS_batch1 = c(covar_df_base[["AUS_batch1"]], paste0("PC", 1:nPCs)),
+    AUS_batch2 = c(covar_df_base[["AUS_batch2"]], paste0("PC", 1:nPCs))
+  )
+  results <- results_glm_per_study(outcome = outcome, samplesheet = samplesheet, covar_df = covar_df) %>% dplyr::mutate(nPCs = nPCs)
+  PCs <- unique(results$nPCs)
+  covar <- stringr::str_split(results$covar, pattern = ",") %>% unlist() %>% unique()
+  results_meta <- purrr::map_df(PCs, .f = function(PC, results, outcome) {results_ <- results %>% dplyr::filter(nPCs == PC); meta_analysis(results_, outcome = outcome) %>% dplyr::mutate(nPCs = PC)}, results = results, outcome = outcome)
+  results_meta$covar <- paste(covar, collapse=",")
+  results_meta
+}
+results_glm_addPC_incremental_meta_wbc <- function(outcome, samplesheet, covar_df, PC_range) {
+  stats <- purrr::map_df(
+    PC_range,
+    .f = results_glm_addPC_meta_wbc,
+    outcome = outcome,
+    samplesheet = samplesheet,
+     covar_df_base = covar_df
+  )
+  stats
+}
+
+
+stats_core_model_incrementalPCs <- dplyr::bind_rows(
+  stats_core_model_incrementalPCs,
+  stats_core_model_incrementalPCs_Age
+)
+
+### Iteratively add covars -----------------------------------
+
+stats_core_model_addcovars <- purrr::map_df(
+  predictors_test[!predictors_test %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f  = results_glm_addcovars,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_core_30controlPCs,
+  covars = c(main_predictors,union(moa_sig_filtered$Probe, limma_tunedlambda1000_1.15_sig_filtered$Probe))
+)
+
+stats_core_model_addcovars_Age <- purrr::map_df(
+   c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f  = results_glm_addcovars,
+  samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_core_30controlPCs_Age,
+  covars = c(main_predictors, gadd_predictors, union(moa_sig_filtered$Probe, limma_tunedlambda1000_1.15_sig_filtered$Probe))
+)
+
+stats_core_model_addcovars_wbc <- purrr::map_df(
+   c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+  .f  = results_glm_addcovars,
+  samplesheet = samplesheet_merged_wbc,
+  covar_df = covar_df_core_30controlPCs_noWBC,
+  covars = c(main_predictors,union(moa_sig_filtered$Probe, limma_tunedlambda1000_1.15_sig_filtered$Probe))
+)
+
+stats_core_model_addcovars <- dplyr::bind_rows(
+  stats_core_model_addcovars, stats_core_model_addcovars_Age,stats_core_model_addcovars_wbc
+)
+
+## For now, only run addcovars for significant PMSs 
+sig_pms <- stats_fine_tuned %>% dplyr::filter(Outcome %in% main_predictors, !Outcome %in% wbc) %>% dplyr::filter(p < threshold_predictors) %$% Outcome
+
+stats_fine_tuned_addcovars <- purrr::map_df(
+   sig_pms[!sig_pms %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f  = results_glm_addcovars,
+  samplesheet = samplesheet_merged,
+  covar_df = covar_df_finetuned,
+  covars = c(main_predictors, union(moa_sig_filtered$Probe, limma_tunedlambda1000_1.15_sig_filtered$Probe))
+)
+
+stats_fine_tuned_addcovars_Age <- purrr::map_df(
+   c("Predicted_Age_Zhang_EN"),
+  .f  = results_glm_addcovars,
+  samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_finetuned_Age,
+  covars = c(main_predictors, union(moa_sig_filtered$Probe, limma_tunedlambda1000_1.15_sig_filtered$Probe))
+)
+
+
+stats_fine_tuned_addcovars_wbc <- purrr::map_df(
+   wbc,
+  .f  = results_glm_addcovars,
+  samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Study != "AUS_batch2"),
+  covar_df = covar_df_finetuned_noWBC,
+  covars = c(main_predictors, union(moa_sig_filtered$Probe, limma_tunedlambda1000_1.15_sig_filtered$Probe))
+)
+
+stats_fine_tuned_addcovars <- dplyr::bind_rows(stats_fine_tuned_addcovars, stats_fine_tuned_addcovars_wbc, stats_fine_tuned_addcovars_Age)
+```
+
+
+## Survival analyses
+
+### Cox
+
+```{r}
+## Cox PH per study followed by meta-analysis ----------------------------------
+results_cox <- function(indep,surv, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_cox_per_study, surv = surv,indep=indep, covar_df = covar_df, samplesheet = samplesheet)
+  covar <- stringr::str_split(stats$covar, pattern = ",") %>% unlist() %>% unique()
+  stats_meta <- meta_analysis(stats, outcome = surv)
+  stats_meta$sample_size <- sum(stats$sample_size)
+  stats_meta <- stats_meta %>% 
+    mutate(indep=indep) %>%
+    dplyr::select(Outcome,indep,sample_size, b, se, dplyr::everything()) %>%
+    dplyr::mutate(covar = paste(covar, collapse = ",")) 
+}
+
+results_cox_per_study <- function(surv, indep, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_cox_per_study, surv = surv, indep=indep, 
+                         covar_df = covar_df, samplesheet = samplesheet)
+}
+
+run_cox_per_study <- function(study, surv, indep, covar_df, samplesheet) {
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[surv]])) && !all(is.na(samplesheet[samplesheet$Study == study,][[indep]]))) {
+    covar <- covar_df[[study]]
+    ## Check if covar is missing for all samples
+    samplesheet_temp <- samplesheet %>% dplyr::filter(Study == study)
+    check <- colSums(!is.na(samplesheet_temp[,covar]))
+    covar <- covar[check!=0]
+    nr_samples <- sum(complete.cases(samplesheet_temp[,covar, drop = FALSE]))
+    formula <- as.formula(sprintf("%s ~ %s + %s", surv, indep, paste(covar, collapse = "+")))
+    model <- coxph(formula, data = samplesheet %>% dplyr::filter(Study == study))
+    tibble(indep = indep, Study = study, b = summary(model)$coef[indep,"coef"], se = summary(model)$coef[indep,"se(coef)"], 
+           z = summary(model)$coef[indep,"z"], p = summary(model)$coef[indep,"Pr(>|z|)"], 
+           sample_size = nr_samples,covar = paste(covar, collapse = ","))
+  } else {
+    NULL
+  }
+}
+
+perc_dead_per_batch <- samplesheet_source %>%
+  dplyr::group_by(Batch) %>%
+  dplyr::summarize(perc_death = sum(Survival_status == "dead", na.rm=TRUE)/dplyr::n())
+batches_keep <- perc_dead_per_batch %>% dplyr::filter(perc_death >= 0.3)
+
+
+## Run analyses ----------------------------------------------------------------
+results_cox_core_model_main_predictors <- purrr::map_df(
+  predictors_test[!predictors_test %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+  .f = results_cox, surv="SurvObj", 
+  samplesheet = samplesheet_merged_survival %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), 
+                                                    Batch %in% batches_keep$Batch),
+  covar_df = covar_df_core_30controlPCs)
+
+
+results_cox_fine_tuned_main_predictors <- purrr::map_df(
+  predictors_test[!predictors_test %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+  .f = results_cox, 
+  surv="SurvObj", 
+  samplesheet = samplesheet_merged_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch),
+  covar_df = covar_df_finetuned)
+
+
+results_cox_core_model_age <- purrr::map_df(
+  "Predicted_Age_Zhang_EN", 
+  .f = results_cox, 
+  surv="SurvObj", 
+  samplesheet = samplesheet_merged_age_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch),
+  covar_df=covar_df_core_30controlPCs_Age)
+
+results_cox_fine_tuned_age <- purrr::map_df(
+  "Predicted_Age_Zhang_EN", 
+  .f = results_cox, 
+  surv="SurvObj", 
+  samplesheet = samplesheet_merged_age_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch),
+  covar_df = covar_df_finetuned_Age)
+
+
+results_cox_core_model_main_predictors <- dplyr::bind_rows(
+  results_cox_core_model_main_predictors,
+  results_cox_core_model_age)
+
+results_cox_fine_tuned_main_predictors <- dplyr::bind_rows(
+  results_cox_fine_tuned_main_predictors,
+  results_cox_fine_tuned_age)
+
+results_cox_core_model_wbc <- purrr::map_df(wbc, 
+  .f = results_cox, 
+  surv="SurvObj", 
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+   dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch),
+  covar_df = covar_df_core_30controlPCs_noWBC)
+
+results_cox_fine_tuned_wbc <- purrr::map_df(wbc, 
+  .f = results_cox, 
+  surv="SurvObj", 
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch),
+   covar_df = covar_df_finetuned_noWBC)
+```
+
+### Cox, stratified, tt-transformed:
+
+```{r}
+## tt models 
+results_cox_strat_tt <- function(indep,surv, samplesheet, covar_df, strata=NULL, tt=NULL, tt_function = function(x, t, ...) x*t/12) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_cox_per_study_strat_tt, surv = surv,indep=indep, covar_df = covar_df, 
+                         samplesheet = samplesheet, strata=strata, tt=tt, tt_function = tt_function)
+  covar <- stringr::str_split(stats$covar, pattern = ",") %>% unlist() %>% unique()
+  stats_meta <- meta_analysis(stats, outcome = surv)
+  stats_meta$sample_size <- sum(stats$sample_size)
+  stats_meta <- stats_meta %>% 
+    mutate(indep=indep) %>%
+    dplyr::select(Outcome,indep,sample_size, b, se, dplyr::everything()) %>%
+    dplyr::mutate(covar = paste(covar, collapse = ",")) 
+}
+
+results_cox_strat_tt_per_study <- function(indep,surv, samplesheet, covar_df, strata=NULL, tt=NULL, tt_function = function(x, t, ...) x*t/12) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_cox_per_study_strat_tt, surv = surv,indep=indep, covar_df = covar_df, samplesheet = samplesheet, strata=strata, tt=tt, tt_function=tt_function)
+  stats
+}
+
+run_cox_per_study_strat_tt <- function(study, surv, indep, covar_df, samplesheet, strata, tt, tt_function = function(x, t, ...) x*t/12) {
+  print(study)
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[surv]])) && !all(is.na(samplesheet[samplesheet$Study == study,][[indep]]))) {
+    covar <- covar_df[[study]]
+    ## Check if covar is missing for all samples.
+    samplesheet_temp <- samplesheet %>% dplyr::filter(Study == study)
+    check <- colSums(!is.na(samplesheet_temp[,covar]))
+    covar <- covar[check!=0]
+    nr_samples <- sum(complete.cases(samplesheet_temp[,covar, drop = FALSE]))
+    
+    if(!is.null(strata) && !is.null(tt)) {
+      formula <- as.formula(sprintf("%s ~ %s + strata(%s) + tt(%s) + %s", surv, indep, strata, tt, paste(covar, collapse = "+")))
+    } else if(!is.null(strata)) {
+      formula <- as.formula(sprintf("%s ~ %s + strata(%s) + %s", surv, indep, strata, paste(covar, collapse = "+")))
+    } else if(!is.null(tt)) {
+      formula <- as.formula(sprintf("%s ~ %s + tt(%s) + %s", surv, indep, tt, paste(covar, collapse = "+")))
+    } else {
+      formula <- as.formula(sprintf("%s ~ %s + %s", surv, indep, paste(covar, collapse = "+")))
+    }
+    
+    model <- coxph(formula, data = samplesheet %>% dplyr::filter(Study == study),
+                   tt = tt_function)
+    tibble(indep = indep, Study = study, b = summary(model)$coef[indep,"coef"], se = summary(model)$coef[indep,"se(coef)"], 
+                        z = summary(model)$coef[indep,"z"], p = summary(model)$coef[indep,"Pr(>|z|)"], 
+                        sample_size = nr_samples,covar = paste(covar, collapse = ","), 
+                        stratification=if(is.null(strata)) NA else strata, tt_variable = if(is.null(tt)) NA else tt)
+                     
+  } else {
+    NULL
+  }
+}
+
+covar_df_core_30controlPCs_noWBC_nobatch <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control"))
+)
+
+covar_df_core_30controlPCs_nobatch <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex","CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK",paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))
+)
+
+covar_df_finetuned_nobatch <- list(
+  mine_450k = c("Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c("Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c("Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c("Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+## Run analyses ----------------------------------------------------------------
+results_cox_core_model_wbc_stratabatch_ttage_logmodel <- purrr::map_df(
+  wbc, 
+  .f = results_cox_strat_tt, 
+  surv="SurvObj", 
+  samplesheet=samplesheet_merged_wbc_survival %>% 
+    dplyr::filter(Study %in% c("mine_450k", "mine_epic"), 
+                  Batch %in% batches_keep$Batch,
+                  Survival_months > 0
+                  ) ,
+  strata="Batch", 
+  tt = "Predicted_Age_Zhang_EN",
+  tt_function = function(x, t, ...) x*log(t),
+  covar_df=covar_df_core_30controlPCs_noWBC_nobatch)
+
+results_cox_core_model_main_predictors_stratabatch_ttage_logmodel <- purrr::map_df(
+  main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+ .f = results_cox_strat_tt, surv="SurvObj", 
+ samplesheet = samplesheet_merged_wbc_survival %>% dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months > 0),
+  strata="Batch", 
+ tt = "Predicted_Age_Zhang_EN",
+ tt_function = function(x, t, ...) x*log(t),
+ covar_df = covar_df_core_30controlPCs_nobatch)
+
+
+results_cox_fine_tuned_main_predictors_stratabatch_ttage_logmodel <- purrr::map_df(
+  main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+  .f = results_cox_strat_tt, 
+   surv="SurvObj",
+   samplesheet = samplesheet_merged_survival %>% 
+                 dplyr::filter(Study %in% c("mine_450k", "mine_epic"), 
+                               Batch %in% batches_keep$Batch, Survival_months > 0),
+   strata="Batch", 
+   tt = "Predicted_Age_Zhang_EN",
+   tt_function = function(x, t, ...) x*log(t),
+   covar_df = covar_df_finetuned_nobatch)
+```
+
+### Royston-parmar models
+
+```{r}
+# Royston-Parmar models
+results_RP <- function(indep,surv, samplesheet, covar_df, knots, scale) {
+  stats <- purrr::map_df(unique(samplesheet$Study), 
+                         .f = run_RP_per_study, 
+                         surv = surv,indep=indep, 
+                         covar_df = covar_df, 
+                         samplesheet = samplesheet,
+                         knots=knots, 
+                         scale=scale)
+  covar <- stringr::str_split(stats$covar, pattern = ",") %>% unlist() %>% unique()
+  stats_meta <- meta_analysis(stats, outcome = surv)
+  stats_meta$sample_size <- sum(stats$sample_size)
+  stats_meta <- stats_meta %>% 
+    mutate(indep=indep) %>%
+    dplyr::select(Outcome,indep,sample_size, b, se, dplyr::everything()) %>%
+    dplyr::mutate(covar = paste(covar, collapse = ","), knots = knots, scale = scale) 
+}
+
+results_RP_per_study <- function(surv, indep, samplesheet, covar_df,knots, scale) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_RP_per_study, surv = surv, indep=indep, 
+                         covar_df = covar_df, samplesheet = samplesheet, knots=knots, scale=scale)
+}
+
+run_RP_per_study <- function(study, surv, indep, covar_df, samplesheet, knots, scale) {
+  print(study)
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[surv]])) && !all(is.na(samplesheet[samplesheet$Study == study,][[indep]]))) {
+    covar <- covar_df[[study]]
+    ## Check if covar is missing for all samples.
+    samplesheet_temp <- samplesheet %>% dplyr::filter(Study == study)
+    check <- colSums(!is.na(samplesheet_temp[,covar]))
+    covar <- covar[check!=0]
+    nr_samples <- sum(complete.cases(samplesheet_temp[,covar, drop = FALSE]))
+    formula <- as.formula(sprintf("%s ~ %s + %s", surv, indep, paste(covar, collapse = "+")))
+    model <- flexsurvspline(formula
+                                 , k = knots,
+                                 scale = scale,
+                                 data = samplesheet %>% dplyr::filter(Study==study))
+    tibble(indep = indep, Study = study, b = model$res[indep, "est"], se =  model$res[indep, "se"], 
+           z = model$res[indep, "est"]/model$res[indep, "se"], 
+           p =  2*pnorm(-abs(z)), 
+           sample_size = nr_samples,covar = paste(covar, collapse = ","))
+  } else {
+    NULL
+  }
+}
+
+## Run analyses ----------------------------------------------------------------
+results_RP_core_model_wbc <- purrr::map_df(wbc,
+  .f = results_RP,
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+           surv = "SurvObj",
+           covar_df = covar_df_core_30controlPCs_noWBC,
+           knots = 1,
+           scale = "hazard")
+
+results_RP_core_model_main_predictors <- purrr::map_df(
+  main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")],
+  .f = results_RP,
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+   surv = "SurvObj",
+   covar_df = covar_df_core_30controlPCs,
+   knots = 1,
+   scale = "hazard")
+
+results_RP_fine_tuned_main_predictors <- purrr::map_df(
+  main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")],
+  .f = results_RP,
+  samplesheet = samplesheet_merged_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+   surv = "SurvObj",
+   covar_df = covar_df_finetuned,
+   knots = 1,
+  scale = "hazard")
+
+results_RP_fine_tuned_age <- purrr::map_df(
+  "Predicted_Age_Zhang_EN",
+   .f = results_RP,
+   samplesheet = samplesheet_merged_age_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+   surv = "SurvObj",
+   covar_df = covar_df_finetuned_Age,
+   knots = 1,
+   scale = "hazard")
+
+
+## Varying number of knots
+results_RP_core_model_wbc_2knots <- purrr::map_df(wbc,
+  .f = results_RP,
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+ surv = "SurvObj",
+ covar_df = covar_df_core_30controlPCs_noWBC,
+ knots = 2,
+ scale = "hazard")
+
+results_RP_core_model_wbc_3knots <- purrr::map_df(wbc,
+  .f = results_RP,
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+                    dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+  surv = "SurvObj",
+  covar_df = covar_df_core_30controlPCs_noWBC,
+  knots = 3,
+  scale = "hazard")
+
+results_RP_core_model_wbc_4knots <- purrr::map_df(wbc,
+  .f = results_RP,
+  samplesheet = samplesheet_merged_wbc_survival %>% 
+                  dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+   surv = "SurvObj",
+   covar_df = covar_df_core_30controlPCs_noWBC,
+   knots = 4,
+   scale = "hazard")
+
+results_RP_core_model_wbc_5knots <- purrr::map_df(wbc,
+   .f = results_RP,
+   samplesheet = samplesheet_merged_wbc_survival %>% 
+     dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+   surv = "SurvObj",
+   covar_df = covar_df_core_30controlPCs_noWBC,
+   knots = 4,
+   scale = "hazard")
+
+
+
+results_RP_fine_tuned_main_predictors_2knots <- purrr::map_df(main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")],
+           .f = results_RP,
+           samplesheet = samplesheet_merged_survival %>% 
+             dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+           surv = "SurvObj",
+           covar_df = covar_df_finetuned,
+           knots = 2,
+           scale = "hazard")
+
+results_RP_fine_tuned_main_predictors_3knots <- purrr::map_df(main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")],
+           .f = results_RP,
+           samplesheet = samplesheet_merged_survival %>% 
+             dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+           surv = "SurvObj",
+           covar_df = covar_df_finetuned,
+           knots = 3,
+           scale = "hazard")
+
+results_RP_fine_tuned_main_predictors_4knots <- purrr::map_df(main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")],
+           .f = results_RP,
+           samplesheet = samplesheet_merged_survival %>% 
+             dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+           surv = "SurvObj",
+           covar_df = covar_df_finetuned,
+           knots = 4,
+           scale = "hazard")
+
+
+results_RP_fine_tuned_main_predictors_5knots <- purrr::map_df(main_predictors[!main_predictors %in% c(wbc, "Predicted_Age_Zhang_EN")],
+         .f = results_RP,
+         samplesheet = samplesheet_merged_survival %>% 
+           dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, Survival_months >0),
+         surv = "SurvObj",
+         covar_df = covar_df_finetuned,
+         knots = 5,
+         scale = "hazard")
+```
+
+### Adjust for C9 status
+
+```{r}
+samplesheet_merged_c9 <- readRDS("../../ewas_122019/data/samplesheet_merged_c9.rds")
+
+samplesheet_merged_survival_c9 <- samplesheet_merged_survival %>%
+  dplyr::left_join(samplesheet_merged_c9[,c("Sample_Name", "C9_status")],by=c("Sample_Name"))
+
+samplesheet_merged_wbc_survival_c9 <- samplesheet_merged_wbc_survival %>%
+  dplyr::left_join(samplesheet_merged_c9[,c("Sample_Name", "C9_status")],by=c("Sample_Name"))
+
+samplesheet_merged_age_survival_c9 <- samplesheet_merged_age_survival %>%
+  dplyr::left_join(samplesheet_merged_c9[,c("Sample_Name", "C9_status")],by=c("Sample_Name"))
+
+## Core model: Predicted Age, Sex, Batch, cellcounts 30 control PCs
+covar_df_core_30controlPCs_C9status <- list(
+  mine_450k = c("C9_status", "Predicted_Age_Zhang_EN", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  mine_epic = c("C9_status", "Predicted_Age_Zhang_EN", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("C9_status", "Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("C9_status", "Predicted_Age_Zhang_EN", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))
+)
+
+covar_df_core_30controlPCs_noWBC_C9status <- list(
+  mine_450k = c("C9_status","Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control")),
+  mine_epic = c("C9_status","Predicted_Age_Zhang_EN", "Sex", "Batch", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("C9_status","Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("C9_status","Predicted_Age_Zhang_EN", "Sex", paste0("PC", 1:30, "_control")))
+
+covar_df_finetuned_C9status <- list(
+  mine_450k = c("C9_status", "Predicted_Age_Zhang_EN", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c("C9_status", "Predicted_Age_Zhang_EN", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c("C9_status", "Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c("C9_status","Predicted_Age_Zhang_EN", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+covar_df_core_30controlPCs_Age_C9status <- list(
+  mine_450k = c("C9_status", "Age", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  mine_epic = c("C9_status","Age", "Sex", "Batch", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch1 = c("C9_status", "Age","Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control")),
+  AUS_batch2 = c("C9_status","Age", "Sex", "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"))
+)
+
+covar_df_finetuned_Age_C9status <- list(
+  mine_450k = c("C9_status", "Age", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c("C9_status", "Age", "Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c("C9_status","Age", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c("C9_status","Age", "Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+
+### Adj. C9
+results_cox_core_model_main_predictors_adjC9 <- purrr::map_df(predictors_test[!predictors_test %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_core_30controlPCs_C9status)
+
+### Not Adj. C9, C9 complete
+results_cox_core_model_main_predictors_C9complete <- purrr::map_df(predictors_test[!predictors_test %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_core_30controlPCs)
+
+
+### WBC
+results_cox_core_model_wbc_adjC9 <- purrr::map_df(wbc, 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_wbc_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_core_30controlPCs_noWBC_C9status)
+
+### Not Adj. C9, C9 complete
+results_cox_core_model_wbc_C9complete <- purrr::map_df(wbc, 
+                                    .f = results_cox, surv="SurvObj", samplesheet=samplesheet_merged_wbc_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), 
+                                                    Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_core_30controlPCs_noWBC)
+
+### Age
+
+### Adj. C9
+results_cox_core_model_age_adjC9 <- purrr::map_df("Predicted_Age_Zhang_EN", 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_age_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_core_30controlPCs_Age_C9status)
+
+### Not Adj. C9, C9 complete
+results_cox_core_model_age_C9complete <- purrr::map_df("Predicted_Age_Zhang_EN", 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_age_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_core_30controlPCs_Age)
+
+# Fine-tuned
+
+## Main predictors
+### Adj. C9
+results_cox_fine_tuned_main_predictors_adjC9 <- purrr::map_df(predictors_test[!predictors_test %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_finetuned_C9status)
+
+### Not Adj. C9, C9 complete
+results_cox_fine_tuned_main_predictors_C9complete <- purrr::map_df(predictors_test[!predictors_test %in% c(wbc, "Predicted_Age_Zhang_EN")], 
+                                    .f = results_cox, 
+                                    surv="SurvObj", 
+                                    samplesheet=samplesheet_merged_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_finetuned)
+
+
+## Age
+results_cox_fine_tuned_age_adjC9 <- purrr::map_df("Predicted_Age_Zhang_EN", 
+                                    .f = results_cox, 
+                                    surv="SurvObj", samplesheet=samplesheet_merged_age_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_finetuned_Age_C9status)
+
+
+results_cox_fine_tuned_age_C9complete <- purrr::map_df("Predicted_Age_Zhang_EN", 
+                                    .f = results_cox, surv="SurvObj", samplesheet=samplesheet_merged_age_survival_c9 %>% 
+                                      dplyr::filter(Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch, !is.na(C9_status)),
+                                    covar_df=covar_df_finetuned_Age)
+```
+
+
+## Age of onset
+
+```{r}
+# Age of onset
+results_lm <- function(outcome, indep, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_lm_per_study, outcome = outcome,indep=indep, covar_df = covar_df, samplesheet = samplesheet)
+  covar <- stringr::str_split(stats$covar, pattern = ",") %>% unlist() %>% unique()
+  stats_meta <- meta_analysis(stats, outcome = outcome)
+  stats_meta$sample_size <- sum(stats$sample_size)
+  stats_meta <- stats_meta %>%
+    dplyr::mutate(indep=indep) %>%
+    dplyr::select(Outcome, indep, sample_size, b, se, dplyr::everything()) %>%
+    dplyr::mutate(covar = paste(covar, collapse = ","))
+
+}
+
+results_lm_per_study <- function(outcome, indep, samplesheet, covar_df) {
+  stats <- purrr::map_df(unique(samplesheet$Study), .f = run_lm_per_study, outcome = outcome, indep=indep, covar_df = covar_df, samplesheet = samplesheet)
+}
+
+run_lm_per_study <- function(study, outcome, indep, covar_df, samplesheet) {
+  if(!all(is.na(samplesheet[samplesheet$Study == study,][[outcome]])) && !all(is.na(samplesheet[samplesheet$Study == study,][[indep]]))) {
+    covar <- covar_df[[study]]
+    ## Check if covar is missing for all samples.
+    samplesheet_temp <- samplesheet %>% dplyr::filter(Study == study)
+    check <- colSums(!is.na(samplesheet_temp[,covar,drop=FALSE]))
+    covar <- covar[check!=0]
+    nr_samples <- sum(complete.cases(samplesheet_temp[,covar, drop = FALSE]) & !is.na(samplesheet_temp[[outcome]]) & !is.na(samplesheet_temp[[indep]]))
+    formula <- as.formula(sprintf("%s ~ %s + %s", outcome, indep, paste(covar, collapse = "+")))
+    model <- lm(formula, data = samplesheet %>% dplyr::filter(Study == study))
+    tibble(Outcome = outcome, indep = indep, Study = study, b = summary(model)$coef[indep,1], se = summary(model)$coef[indep,2], t = summary(model)$coef[indep,3], p = summary(model)$coef[indep,4], sample_size = nr_samples,covar = paste(covar, collapse = ","))
+  } else {
+    NULL
+  }
+}
+
+
+covar_df_finetuned_noAge <- list(
+  mine_450k = c("Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res")),
+  mine_epic = c("Sex", "Batch",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:15, "_res")),
+  AUS_batch1 = c("Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:25, "_res")),
+  AUS_batch2 = c("Sex",  "CD4T", "CD8T", "Mono", "Gran", "NK", paste0("PC", 1:30, "_control"), paste0("PC", 1:30, "_res"))
+)
+
+## Age diff adjusted for age
+stats_fine_tuned_age_of_onset_age_diff <- results_lm(
+  indep = "age_diff",
+  outcome = "Age_at_onset_days",
+  samplesheet = samplesheet_merged_age_age_of_onset %>% dplyr::filter(!Study %in% c("AUS_batch1", "AUS_batch2"), Batch %in% batches_keep$Batch) %>% dplyr::mutate(Age_at_onset_days = Age_at_onset_days/365.5, age_diff = Predicted_Age_Zhang_EN - Age),
+  covar_df = covar_df_finetuned_Age
+)
+
+## Age diff adjusted for age not adjusted for age
+stats_fine_tuned_age_of_onset_age_diff_noagecovar = results_lm(
+  indep="age_diff", 
+  outcome = "Age_at_onset_days",
+  samplesheet = samplesheet_merged_noage %>% 
+    dplyr::filter(!Study %in% c("AUS_batch1", "AUS_batch2"), Batch %in% batches_keep$Batch) %>% 
+    dplyr::mutate(Age_at_onset_days = Age_at_onset_days/365.5, 
+                  age_diff = Predicted_Age_Zhang_EN - Age),
+   covar_df = covar_df_finetuned_noAge)
+```
+
+## Survival age_diff
+
+```{r}
+results_cox_fine_tuned_age_diff <- purrr::map_df("age_diff", 
+                                    .f = results_cox, 
+                                    surv = "SurvObj", 
+                                    samplesheet = samplesheet_merged_age_survival %>% 
+                                      dplyr::filter(!is.na(Age),
+                                                    Study %in% c("mine_450k", "mine_epic"), Batch %in% batches_keep$Batch) %>%
+                                      dplyr::mutate(age_diff=Predicted_Age_Zhang_EN - Age), 
+                                    covar_df = covar_df_finetuned_Age)
+
+
+results_cox_fine_tuned_age_diff_noagecovar <- purrr::map_df("age_diff", 
+                                    .f = results_cox,
+                                    surv="SurvObj", samplesheet=samplesheet_merged_noage_survival %>% 
+  dplyr::filter(!is.na(Age), Study %in% c("mine_450k", "mine_epic"), 
+                Batch %in% batches_keep$Batch) %>% 
+    dplyr::mutate(age_diff= Predicted_Age_Zhang_EN - Age), 
+  covar_df = covar_df_finetuned_noAge)
+```
+
+
+## Sensitivity: leave out C9-samples
+
+```{r}
+## Leave out C9 samples
+stats_core_model_c9negative <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged %>% dplyr::filter(Sample_Name %in% merged_keep_c9negative),
+  covar_df = covar_df_core_30controlPCs
+)
+
+stats_core_model_c9negative_wbc <- purrr::map_df(
+  wbc,
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Sample_Name %in% merged_keep_c9negative),
+  covar_df = covar_df_core_30controlPCs_noWBC
+)
+
+
+stats_fine_tuned_c9negative <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged %>% dplyr::filter(Sample_Name %in% merged_keep_c9negative),
+  covar_df = covar_df_finetuned
+)
+
+stats_fine_tuned_c9negative_wbc <- purrr::map_df(
+  wbc,
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Sample_Name %in% merged_keep_c9negative),
+  covar_df = covar_df_finetuned_noWBC
+)
+
+stats_core_model_age_c9negative <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age %>%  dplyr::filter(Sample_Name %in% merged_keep_c9negative),
+  covar_df = covar_df_core_30controlPCs_Age
+)
+
+stats_finetuned_age_c9negative <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age  %>%  dplyr::filter(Sample_Name %in% merged_keep_c9negative),
+  covar_df = covar_df_finetuned_Age
+)
+
+stats_core_model_c9negative <- dplyr::bind_rows(
+  stats_core_model_c9negative,
+  stats_core_model_c9negative_wbc,
+  stats_core_model_age_c9negative)
+
+
+stats_fine_tuned_c9negative <- dplyr::bind_rows(
+  stats_fine_tuned_c9negative,
+  stats_fine_tuned_c9negative_wbc,
+  stats_finetuned_age_c9negative)
+
+
+# Downsampled (to same sample size as c9-negative)
+stats_core_model_c9downsampled <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged %>% dplyr::filter(Sample_Name %in% merged_keep_c9downsampled),
+  covar_df = covar_df_core_30controlPCs
+)
+
+stats_core_model_c9downsampled_wbc <- purrr::map_df(
+  wbc,
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Sample_Name %in% merged_keep_c9downsampled),
+  covar_df = covar_df_core_30controlPCs_noWBC
+)
+
+stats_fine_tuned_c9downsampled <- purrr::map_df(
+  all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+  .f = results_glm,
+  samplesheet = samplesheet_merged %>% dplyr::filter(Sample_Name %in% merged_keep_c9downsampled),
+  covar_df = covar_df_finetuned
+)
+
+stats_fine_tuned_c9downsampled_wbc <- purrr::map_df(
+  wbc,
+  .f = results_glm,
+  samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Sample_Name %in% merged_keep_c9downsampled),
+  covar_df = covar_df_finetuned_noWBC
+)
+
+stats_core_model_age_c9downsampled <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age %>%  dplyr::filter(Sample_Name %in% merged_keep_c9downsampled),
+  covar_df = covar_df_core_30controlPCs_Age
+)
+
+stats_finetuned_age_c9downsampled <- purrr::map_df(
+  c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+  .f = results_glm,
+  samplesheet = samplesheet_merged_age  %>%  dplyr::filter(Sample_Name %in% merged_keep_c9downsampled),
+  covar_df = covar_df_finetuned_Age
+)
+
+stats_core_model_c9downsampled <- dplyr::bind_rows(
+  stats_core_model_c9downsampled,
+  stats_core_model_c9downsampled_wbc,
+  stats_core_model_age_c9downsampled)
+
+stats_fine_tuned_c9downsampled <- dplyr::bind_rows(
+  stats_fine_tuned_c9downsampled,
+  stats_fine_tuned_c9downsampled_wbc,
+  stats_finetuned_age_c9downsampled)
+```
+
+## Sensitivity analyses
+
+```{r}
+leave_one_cohort_out_pheno <- function(leave_out_cohort) {
+    stats_fine_tuned <- purrr::map_df(
+    all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+    .f = results_glm,
+    samplesheet = samplesheet_merged %>% dplyr::filter(Study != leave_out_cohort),
+    covar_df = covar_df_finetuned
+  )
+  
+  stats_fine_tuned_age <- purrr::map_df(
+    c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+    .f = results_glm,
+    samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2") %>% dplyr::filter(Study != leave_out_cohort),
+    covar_df = covar_df_finetuned_Age 
+  )
+  
+  stats_core_model_wbc <- purrr::map_df(
+    c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+    .f = results_glm,
+    samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Study != leave_out_cohort),
+    covar_df = covar_df_core_30controlPCs_noWBC 
+  )
+  stats <- dplyr::bind_rows(
+  stats_fine_tuned,
+  stats_fine_tuned_age,
+  stats_core_model_wbc
+  ) %>% mutate(left_out_cohort = leave_out_cohort )
+}
+
+leave_one_batch_out_pheno <- function(leave_out_batch) {
+    stats_fine_tuned <- purrr::map_df(
+    all_predictors[!all_predictors %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath", "CD4T", "CD8T", "Mono", "NK", "Gran", "B")],
+    .f = results_glm,
+    samplesheet = samplesheet_merged %>% dplyr::filter(Batch != leave_out_batch),
+    covar_df = covar_df_finetuned
+  )
+  
+  stats_fine_tuned_age <- purrr::map_df(
+    c("Predicted_Age_Zhang_EN", "Predicted_Age_Hannum", "Predicted_Age_Horvath"),
+    .f = results_glm,
+    samplesheet = samplesheet_merged_age %>% dplyr::filter(Study != "AUS_batch2") %>% dplyr::filter(Batch != leave_out_batch),
+    covar_df = covar_df_finetuned_Age 
+  )
+  
+  stats_core_model_wbc <- purrr::map_df(
+    c("CD4T", "CD8T", "Mono", "NK", "Gran", "B"),
+    .f = results_glm,
+    samplesheet = samplesheet_merged_wbc %>% dplyr::filter(Batch != leave_out_batch),
+    
+    covar_df = covar_df_core_30controlPCs_noWBC 
+  )
+  stats <- dplyr::bind_rows(
+  stats_fine_tuned,
+  stats_fine_tuned_age,
+  stats_core_model_wbc
+  ) %>% mutate(left_out_batch = leave_out_batch)
+}
+
+stats_leave_one_cohort_out <- purrr::map_df(unique(samplesheet_merged$Study), .f = leave_one_cohort_out_pheno)
+stats_leave_one_batch_out <- purrr::map_df(unique(samplesheet_merged$Batch), .f = leave_one_batch_out_pheno)
+```
+
+
+
+# Plots
+
+## Miami plots
+
+```{r}
+text_size=9
+text_size.x=8
+point_size=1
+```
+
+
+```{r}
+# Order based on P-values
+order <- stats_fine_tuned %>%
+  dplyr::filter(Outcome %in% gadd_predictors | Outcome %in%  c("smokingScore_Elliot", "dnamalc.144cpg_Liu", "BMI_Hamilton", "CRP_Ligthart", "HDLchol_McCartney", "Predicted_Age_Zhang_EN")) %>% dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>% dplyr::arrange(p) %$% Outcome
+
+# Miami plot
+plot_finetuned_mainpredictorsgaddpredictors_miami <- stats_fine_tuned %>%
+  dplyr::filter(Outcome %in% gadd_predictors | Outcome %in%  c("smokingScore_Elliot", "dnamalc.144cpg_Liu", "BMI_Hamilton", "CRP_Ligthart", "HDLchol_McCartney", "Predicted_Age_Zhang_EN")) %>%
+  dplyr::mutate(Effect = ifelse(b < 0, "decreased risk", "increased risk"),
+                logp = -log10(p)) %>%
+  dplyr::arrange(p) %>%
+  dplyr::bind_rows(
+    results_cox_fine_tuned_main_predictors %>%
+      dplyr::filter(indep %in% c(gadd_predictors,  c("smokingScore_Elliot", "dnamalc.144cpg_Liu", "BMI_Hamilton", "CRP_Ligthart", "HDLchol_McCartney", "Predicted_Age_Zhang_EN"))) %>% dplyr::select(-Outcome) %>% dplyr::rename(Outcome=indep) %>%
+      dplyr::mutate(logp = log10(p),
+                    Effect = ifelse(b < 0, "increased survival", "decreased survival"))
+  ) %>%
+  dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>%
+  dplyr::mutate(Outcome = factor(Outcome, levels = order),
+                Effect = factor(Effect, levels = c("increased risk", "decreased risk", "decreased survival", "increased survival"))) %>%
+  ggplot(
+    aes(x = Outcome, y = logp, fill = Effect)
+  ) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(threshold_predictors),
+             linetype = "dashed") +
+  geom_hline(yintercept = log10(threshold_predictors),
+             linetype = "dashed") +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values=c("increased risk" = "black", "decreased risk" = "grey",
+                             "decreased survival" = "black", "increased survival" = "grey")) +
+  scale_y_continuous(breaks = c(-5, 0, 5, 10), labels = c(5, 0, 5 , 10),limits = c(-5, 10)) +
+  theme_classic() +
+  xlab("")+
+  theme(
+    text = element_text(size = text_size),
+    axis.text.x = element_text(size = text_size.x-1, angle = 45, hjust = 1),
+  ) +
+  ylab(expression(-log[10](italic(p))))
+
+plot_finetuned_mainpredictorsgaddpredictors_miami + guides(fill = FALSE)
+```
+
+WBC:
+
+```{r}
+# Order based on p-values
+order <- stats_core_model %>%
+  dplyr::filter(Outcome %in% wbc) %>% dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>% dplyr::arrange(p) %$% Outcome
+
+hlines <- tibble(
+  what = c("disease risk", "Survival"),
+  val = c(-log10(threshold_predictors), log10(threshold_predictors))
+)
+
+scales_y <- list(
+  Survival = scale_y_continuous(breaks = c(0, -1, -2, -3, -4), labels = c(0, 1, 2, 3, 4)),
+  `disease risk` = scale_y_continuous(breaks = c(0, 20, 40, 60), labels = c(0, 20, 40, 60))
+)
+
+## Miami plot
+plot_core_model_wbc_miami <- stats_core_model %>%
+  dplyr::filter(Outcome %in% wbc) %>%
+  dplyr::mutate(Effect = ifelse(b < 0, "decreased risk", "increased risk"),
+                logp = -log10(p),
+                what = "disease risk") %>%
+  dplyr::arrange(p) %>%
+  dplyr::bind_rows(
+    results_cox_core_model_wbc %>%
+      dplyr::filter(indep %in% wbc) %>% dplyr::select(-Outcome)  %>% dplyr::rename(Outcome=indep) %>%
+      dplyr::mutate(logp = log10(p)) %>%
+      dplyr::mutate(Effect = ifelse(b < 0, "increased survival", "decreased survival"),
+                    what = "Survival") 
+  ) %>%
+  dplyr::mutate(Outcome = factor(Outcome, levels = order),
+                Effect = factor(Effect, levels = c("increased risk", "decreased risk", "decreased survival", "increased survival"))) %>%
+  ggplot(
+    aes(x = Outcome, y = logp, fill = Effect)
+  ) +
+  geom_bar(stat = "identity") +
+  geom_hline(data= hlines, aes(yintercept=val), linetype="dashed") + 
+  scale_fill_manual(values=c("increased risk" = "black", "decreased risk" = "grey",
+                             "decreased survival" = "black", "increased survival" = "grey")) +
+ scale_y_continuous(breaks = c(-4, -3, -2, -1, 0, 0, 20, 40, 60), labels = c(4, 3, 2, 1, 0, 0, 20, 40, 60)) +
+  theme_classic() +
+  xlab("")+
+  theme(
+    text = element_text(size = text_size),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+  ) +
+  ylab(expression(-log[10](italic(p)))) +
+  facetscales::facet_grid_sc(rows = vars(what), scales = list(y = scales_y)) +
+  theme(strip.text.y = element_blank()) 
+
+plot_core_model_wbc_miami
+```
+
+## Compare fine-tuned model with fine-tuned + predictors
+
+### Alcohol, HDL-c, BMI
+
+```{r}
+check <- stats_fine_tuned %>%
+  dplyr::filter(p < threshold_predictors) %>%
+  dplyr::filter(!Outcome %in% wbc, Outcome %in%  c("smokingScore_Elliot", "dnamalc.144cpg_Liu", "BMI_Hamilton", "CRP_Ligthart", "HDLchol_McCartney", "Predicted_Age_Zhang_EN")) %>%
+  dplyr::left_join(stats_fine_tuned_all_predictors, by = "Outcome")
+max <- max(-log10(check$p.x), -log10(check$p.y))
+
+compare_fine_tuned_fine_tuned_adjmainpredictors_mainpredictors_sig <- ggplot(check %>% filter(Outcome %in% main_predictors, Outcome != "Predicted_Age_Zhang_EN") %>% dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ), aes(x = -log10(p.x), y = -log10(p.y))) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  geom_hline(yintercept=-log10(threshold_predictors), linetype = "dashed") +
+  geom_point(size = point_size) +
+  geom_vline(xintercept=-log10(threshold_predictors), linetype = "dashed") +
+  ggrepel::geom_label_repel(aes(label=Outcome), size = point_size*2, fill="white") +
+  theme_classic() +
+  xlab(expression(-log[10](italic(p)))) +
+  ylab(expression(-log[10](italic(p))~adjusted~`for`~all~PMSs)) +
+  xlim(0, max) +
+  ylim(0, max) +
+  theme(
+    text = element_text(size = text_size)
+  )
+compare_fine_tuned_fine_tuned_adjmainpredictors_mainpredictors_sig
+```
+
+## Sensitivity analyses
+
+### Cumulatively add PCs
+
+```{r}
+plot_core_model_incrementalPCs_spaghetti_mainpredictors <- stats_core_model_incrementalPCs %>%
+  dplyr::filter(Outcome %in% c("BMI_Hamilton", "HDLchol_McCartney", "dnamalc.144cpg_Liu", "smokingScore_Elliot")) %>%
+  dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  )  %>%
+  dplyr::rename(PMS = Outcome) %>% 
+  ggplot(aes(x = nPCs, y = -log10(p), color = PMS)) +
+    geom_hline(yintercept = -log10(threshold_predictors), linetype = "dashed") +
+    geom_point(size=point_size) +
+    geom_line() +
+    ggpubr::theme_pubclean() +
+    theme_classic() +
+    colorblindr::scale_color_OkabeIto() +
+    theme(
+      text = element_text(size = text_size)
+    ) +
+    ylab(expression(-log[10](italic(p)))) 
+plot_core_model_incrementalPCs_spaghetti_mainpredictors
+```
+
+Significant Gadd et al. PMSs:
+
+```{r}
+sig_gadd_core <- stats_core_model %>%
+  dplyr::filter(Outcome %in% gadd_predictors) %>%
+  dplyr::filter(p < threshold_predictors) %$% Outcome
+
+plot_core_model_incrementalPCs_spaghetti_gadd_sig <- stats_core_model_incrementalPCs %>%
+  dplyr::filter(Outcome %in% sig_gadd_core | Outcome %in% c("CRP_Ligthart")) %>%
+  dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>%
+  dplyr::rename(PMS = Outcome) %>% 
+  ggplot(aes(x = nPCs, y = -log10(p), color = PMS)) +
+    geom_hline(yintercept = -log10(threshold_predictors), linetype = "dashed") +
+    geom_point(size=point_size) +
+    geom_line() +
+    ggpubr::theme_pubclean() +
+    theme_classic() +
+    scale_color_viridis_d() +
+    theme(
+      text = element_text(size = text_size)
+    ) +
+    ylab(expression(-log[10](italic(p)))) 
+plot_core_model_incrementalPCs_spaghetti_gadd_sig
+```
+
+### sensitivity: Add DMPs
+
+```{r}
+plot_addcpg <- function(outcome, stats, order = NULL, highlight=TRUE, add_title=FALSE) {
+  if(is.null(order)) {
+    dat <- stats %>%
+      dplyr::filter(Outcome == outcome, stringr::str_detect(add_covar,"^cg.*")) %>%
+      dplyr::left_join(anno[,c("Name", "Gene")], by = c("add_covar" = "Name")) %>%
+      dplyr::mutate(add_covar = paste(add_covar, Gene, sep = ";")) %>%
+      dplyr::arrange(p) %>%
+      dplyr::mutate(add_covar = factor(add_covar, levels = add_covar)) 
+  } else {
+    dat <- stats %>%
+      dplyr::filter(Outcome == outcome, stringr::str_detect(add_covar,"^cg.*")) %>%
+      dplyr::left_join(anno[,c("Name", "Gene")], by = c("add_covar" = "Name")) %>%
+      dplyr::mutate(add_covar = paste(add_covar, Gene, sep = ";")) %>%
+      dplyr::mutate(add_covar = factor(add_covar, levels = order))
+  }
+
+  if(highlight) {
+    not_sig <- dat %>% dplyr::filter(p > threshold_predictors) %$% add_covar %>% as.character()
+face = ifelse(levels(dat$add_covar) %in% not_sig, "bold", "plain")
+  } else {
+    face = rep("plain", length(levels(dat$add_covar)))
+  }
+
+plot <- dat %>% ggplot(
+    aes(x = add_covar, y = -log10(p))
+) +
+  geom_segment(
+    aes(x = add_covar, xend = add_covar, y = 0, yend = -log10(p)), 
+    color = "lightgray"
+     ) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = -log10(threshold_predictors),
+             linetype = "dashed") +
+  geom_hline(yintercept = 0
+             ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 11),
+    axis.text.x = element_text(face = face,size = 8, angle = 45, hjust = 1),
+  ) +
+  ylab("\n\n\n\n-log10(p)") +
+  xlab("")
+if(add_title) {
+  plot <- plot + ggtitle(sprintf("%s | full model + significant CpG", outcome))
+}
+plot
+}
+
+order <- limma_tunedlambda1000_1.15 %>% 
+  dplyr::filter(Probe %in% union(limma_tunedlambda1000_1.15_sig_filtered$Probe, moa_sig_filtered$Probe)) %>%
+  dplyr::arrange(p) %>%
+  dplyr::left_join(anno[,c("Name","Gene")], by = c("Probe"="Name")) %$% paste(Probe, Gene, sep = ";")
+  
+plots_finetuned_add_individual_probes <- purrr::map(c("HDLchol_McCartney", "BMI_Hamilton", "dnamalc.144cpg_Liu"), 
+              .f = plot_addcpg,
+              stats=stats_fine_tuned_addcovars,
+              order = order
+              )
+
+for(plot in plots_finetuned_add_individual_probes) {
+  print(plot)
+}
+```
+
+
+### sensitivity : add PMSs to model
+
+```{r}
+plot_addpredictor <- function(outcome, stats, predictors_test) {
+  print(outcome)
+  stats %>%
+    dplyr::filter(Outcome == outcome, add_covar != outcome, add_covar %in% predictors_test) %>%
+    dplyr::arrange(p) %>%
+    dplyr::mutate(add_covar = factor(add_covar, levels = add_covar)) %>%
+ggplot(
+    aes(x = add_covar, y = -log10(p))
+) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = -log10(threshold_predictors),
+             linetype = "dashed") +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 13),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+  ) +
+  ylab("\n\n\n\n-log10(p)") +
+  xlab("") +
+  ggtitle(sprintf("%s | core model + predictor", outcome))
+}
+
+```
+
+
+Alcohol, BMI, HDL-c:
+
+```{r}
+plot_fine_tuned_add_individual_mainpredictors_sig <- stats_fine_tuned_addcovars %>%
+  dplyr::filter(Outcome %in% c("dnamalc.144cpg_Liu", "HDLchol_McCartney", "BMI_Hamilton"),
+                !add_covar %in% wbc, add_covar %in% main_predictors, add_covar != "Predicted_Age_Zhang_EN",
+                Outcome != add_covar
+                ) %>%
+  dplyr::mutate(
+     Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    ),
+    add_covar = dplyr::case_when(
+      add_covar == "BMI_Hamilton" ~ "BMI",
+      add_covar == "HDLchol_McCartney" ~ "HDL-c",
+      add_covar == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      add_covar == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      add_covar == "smokingScore_Elliot" ~ "Smoking",
+      add_covar == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ add_covar
+    )
+  ) %>%
+  dplyr::rename(PMS = Outcome) %>%
+  ggplot(aes(x = add_covar, y = -log10(p))) +
+   geom_segment(
+    aes(x = add_covar, xend = add_covar, y = 0, yend = -log10(p)), 
+    color = "lightgray"
+     ) +
+    geom_point(size=2) +
+    ggpubr::theme_pubclean() +
+    geom_hline(yintercept = -log10(threshold_predictors), linetype = "dashed") +
+    theme_classic() +
+    xlab("")+
+    theme(
+      text = element_text(size = text_size+2),
+      axis.text.x = element_text(angle=45, hjust=1)
+    ) +
+    facet_wrap(~PMS, nrow = 4, scales = "free_y")
+plot_fine_tuned_add_individual_mainpredictors_sig
+```
+WBC:
+
+```{r}
+plot_core_model_add_individual_pms_wbc<- stats_core_model_addcovars_wbc %>%
+  dplyr::filter(Outcome %in% wbc,
+                !add_covar %in% wbc,
+                Outcome != add_covar,
+                add_covar %in% all_predictors
+                ) %>%
+  dplyr::mutate(
+    add_covar = dplyr::case_when(
+      add_covar == "BMI_Hamilton" ~ "BMI",
+      add_covar == "HDLchol_McCartney" ~ "HDL-c",
+      add_covar == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      add_covar == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      add_covar == "smokingScore_Elliot" ~ "Smoking",
+      add_covar == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ add_covar
+    )
+  ) %>%
+  dplyr::mutate(add_covar = factor(add_covar, levels = c("BMI", "HDL-c", "Alcohol", "Age Acceleration", "Smoking", "CRP", gadd_predictors))) %>%
+  dplyr::rename(PMS = Outcome) %>%
+  ggplot(aes(x = add_covar, y = -log10(p))) +
+   geom_segment(
+    aes(x = add_covar, xend = add_covar, y = 0, yend = -log10(p)), 
+    color = "lightgray"
+     ) +
+    geom_point(size=2) +
+    ggpubr::theme_pubclean() +
+    geom_hline(yintercept = -log10(threshold_predictors), linetype = "dashed") +
+    theme_classic() +
+    xlab("")+
+    theme(
+      text = element_text(size = text_size+2),
+      axis.text.x = element_text(angle=45, hjust=1)
+    ) +
+    facet_wrap(~PMS, nrow = 3, ncol=2, scales = "free_y")
+
+
+plot_core_model_add_individual_pms_wbc
+```
+
+### Compare age predictors 
+
+```{r}
+check_age_associations_fine_tuned <- 
+  stats_fine_tuned %>%
+  dplyr::filter(Outcome %in% c("Predicted_Age_Zhang_EN", "Predicted_Age_Horvath", "Predicted_Age_Hannum")) %>%
+  tidyr::gather(
+    key = "what",
+    value = "p",
+    p, Q.p
+  ) %>%
+  dplyr::mutate(what = ifelse(what == "p", "Association P-value", "Heterogeneity (Cochran's Q-test)")) %>%
+  dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Zhang",
+      Outcome == "Predicted_Age_Horvath" ~ "Horvath",
+      Outcome == "Predicted_Age_Hannum" ~ "Hannum"
+    )
+  ) %>%
+  dplyr::mutate(Outcome = factor(Outcome, levels = c("Zhang", "Horvath", "Hannum"))) %>%
+  ggplot(aes(x = Outcome, y = -log10(p))) +
+  geom_segment(
+    aes(x = Outcome, xend = Outcome, y = -0.05, yend = -log10(p)), 
+    color = "lightgray"
+     ) +
+  geom_point(size = point_size) +
+  theme_classic() +
+  geom_hline(yintercept = -log10(threshold_predictors), linetype="dashed") +
+  theme(
+    text = element_text(size = text_size)
+  ) +
+  xlab("") +
+  ylab(expression(-log[10](italic(p)))) +
+  facet_wrap(~what, nrow=2)
+check_age_associations_fine_tuned
+```
+
+### Leave out C9 carriers 
+
+```{r}
+check <- stats_fine_tuned_c9downsampled %>% filter(Outcome %in% main_predictors, !Outcome %in% wbc) %>%
+  dplyr::filter(Outcome %in% c("BMI_Hamilton", "HDLchol_McCartney", "dnamalc.144cpg_Liu")) %>%
+  dplyr::left_join(stats_fine_tuned_c9negative, by = "Outcome")
+
+max <- max(-log10(check$p.x), -log10(check$p.y))
+
+compare_c9downsampled_c9negative_fine_tuned_sig <- ggplot(check %>% dplyr::filter(Outcome %in% c("BMI_Hamilton", "HDLchol_McCartney", "dnamalc.144cpg_Liu")) %>% dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) , aes(x = -log10(p.x), y = -log10(p.y))) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  geom_point(size = point_size) +
+  ggrepel::geom_label_repel(aes(label=Outcome), size=point_size*2) +
+  theme_classic() +
+  xlab("-log10(p) - downsampled") +
+  ylab("-log10(p) - C9-negative") +
+  xlim(0, max) +
+  ylim(0, max) +
+  theme(
+    text = element_text(size = text_size)
+  )
+compare_c9downsampled_c9negative_fine_tuned_sig
+```
+
+```{r}
+check <- stats_core_model_c9downsampled %>%
+  dplyr::filter(Outcome %in% wbc) %>%
+  dplyr::left_join(stats_core_model_c9negative, by = "Outcome")
+max <- max(-log10(check$p.x), -log10(check$p.y))
+
+compare_c9downsampled_c9negative_wbc <- ggplot(check %>% filter(Outcome %in% main_predictors), aes(x = -log10(p.x), y = -log10(p.y))) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  geom_point(size = point_size) +
+  ggrepel::geom_label_repel(aes(label=Outcome), size = point_size*2) +
+  theme_classic() +
+  xlab("-log10(p) - downsampled") +
+  ylab("-log10(p) - C9-negative") +
+  xlim(0, max) +
+  ylim(0, max) +
+  theme(
+    text = element_text(size = text_size)
+  )
+compare_c9downsampled_c9negative_wbc
+```
+### Leave-one-out analyses
+
+#### Strata
+
+```{r}
+leave_one_cohort_out_main_predictors_sig <- stats_leave_one_cohort_out %>%
+  dplyr::filter(Outcome %in% c("BMI_Hamilton", "HDLchol_McCartney", "dnamalc.144cpg_Liu" )) %>%
+  dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>%
+  dplyr::rename(left_out_stratum = left_out_cohort) %>% 
+  dplyr::mutate(left_out_stratum = factor(left_out_stratum, levels = c("mine_450k", "mine_epic", "AUS_batch1", "AUS_batch2"))) %>%
+  ggplot(aes(x = left_out_stratum, y = -log10(p))) +
+  theme_classic() +
+  geom_hline(yintercept = -log10(threshold_predictors), linetype="dashed") +
+  geom_point(size = point_size) +
+  geom_hline(data = stats_fine_tuned %>% dplyr::filter(Outcome %in% c("BMI_Hamilton", "HDLchol_McCartney", "dnamalc.144cpg_Liu" )) %>% dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ), aes(yintercept = -log10(p))) +
+  ylab("-log10(p)\n") +
+  ylim(0,12) +
+  theme(text = element_text(size = text_size),
+        axis.text.x = element_text(size = text_size.x, angle=45, hjust=1)) +
+  facet_wrap(~Outcome, scales = "free", nrow=3)
+leave_one_cohort_out_main_predictors_sig
+```
+
+```{r}
+leave_one_cohort_out_main_predictors_wbc <- stats_leave_one_cohort_out %>%
+  dplyr::filter(Outcome %in% wbc) %>%
+  dplyr::rename(left_out_stratum = left_out_cohort) %>% 
+  dplyr::mutate(left_out_stratum = factor(left_out_stratum, levels = c("mine_450k", "mine_epic", "AUS_batch1", "AUS_batch2"))) %>%
+  ggplot(aes(x = left_out_stratum, y = -log10(p))) +
+  theme_classic() +
+  geom_hline(yintercept = -log10(threshold_predictors), linetype="dashed") +
+  geom_point(size = point_size) +
+  geom_hline(data = stats_core_model %>% dplyr::filter(Outcome %in% wbc), aes(yintercept = -log10(p))) +
+  ylab("-log10(p)\n") +
+  theme(text = element_text(size = text_size),
+        axis.text.x = element_text(size = text_size.x, angle=45, hjust=1)) +
+  facet_wrap(~Outcome, scales = "free")
+leave_one_cohort_out_main_predictors_wbc
+```
+
+#### Batches
+
+```{r}
+leave_one_batch_out_plots <- list()
+for(predictor in  c("BMI","Age Acceleration", "HDL-c", "Alcohol" )) {
+ leave_one_batch_out_plots[[predictor]] <- stats_leave_one_batch_out %>%
+   dplyr::arrange(desc(p)) %>%
+   dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>%
+   dplyr::filter(Outcome == predictor, !left_out_batch %in% c("AUS_batch1", "AUS_batch2")) %>%
+   head(8) %>%
+   dplyr::mutate(left_out_batch = factor(left_out_batch, levels = left_out_batch)) %>%
+  ggplot(aes(x = left_out_batch, y = -log10(p))) +
+  theme_classic() +
+  geom_hline(yintercept = -log10(threshold_predictors), linetype="dashed") +
+  geom_hline(yintercept = -log10(stats_fine_tuned %>% dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>% dplyr::filter(Outcome==predictor) %$% p)) +
+  geom_point(size = point_size) +
+  ylab("\n\n\n\n\n\n\n-log10(p)") +
+  theme(text = element_text(size = text_size),
+        axis.text.x = element_text(size = text_size.x, angle=45, hjust=1)) +
+   ggtitle(predictor)
+}
+for(plot in leave_one_batch_out_plots) {
+  print(plot)
+}
+```
+
+```{r}
+leave_one_batch_out_plots_wbc <- list()
+for(predictor in wbc) {
+ leave_one_batch_out_plots_wbc[[predictor]] <- stats_leave_one_batch_out %>%
+  dplyr::filter(Outcome == predictor, !left_out_batch %in% c("AUS_batch1", "AUS_batch2")) %>%
+   dplyr::arrange(desc(p)) %>%
+   head(8) %>% 
+   dplyr::mutate(left_out_batch = factor(left_out_batch, levels = left_out_batch)) %>%
+   dplyr::mutate(
+    Outcome = dplyr::case_when(
+      Outcome == "BMI_Hamilton" ~ "BMI",
+      Outcome == "HDLchol_McCartney" ~ "HDL-c",
+      Outcome == "dnamalc.144cpg_Liu" ~ "Alcohol",
+      Outcome == "Predicted_Age_Zhang_EN" ~ "Age Acceleration",
+      Outcome == "smokingScore_Elliot" ~ "Smoking",
+      Outcome == "CRP_Ligthart" ~ "CRP",
+      TRUE ~ Outcome
+    )
+  ) %>%
+  ggplot(aes(x = left_out_batch, y = -log10(p))) +
+  theme_classic() +
+  geom_hline(yintercept = -log10(threshold_predictors), linetype="dashed") +
+  geom_hline(yintercept = -log10(stats_core_model %>% dplyr::filter(Outcome==predictor) %$% p)) +
+  geom_point(size = point_size) +
+  ylab("\n\n\n\n\n\n-log10(p)") +
+  theme(text = element_text(size = text_size),
+        axis.text.x = element_text(size = text_size.x, angle=45, hjust=1)) +
+   ggtitle(predictor)
+}
+for(plot in leave_one_batch_out_plots_wbc) {
+  print(plot)
+}
+```
+
+### Survival sensitivity analyses
+
+#### Cox models 
+
+```{r}
+compare_pvals <- function(stats1, stats2, label1, label2, highlight = NULL, highlight_sig = TRUE,
+                          threshold = NULL, text_size = 9, point_size = 1, show_legend = TRUE,
+                          annotation = NULL) {
+  
+  # Add logp
+  
+  stats1 <- stats1 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+  stats2 <- stats2 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+
+  # Add logp
+  if(is.null(threshold)) {
+    threshold <- 0.05 / nrow(stats1)
+  }
+  
+  combined <- stats1[,c("Probe", "p", "b", "t", "logp")] %>%
+    dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp")], by = "Probe") %>%
+    dplyr::mutate(Sig = dplyr::case_when(
+      p.x < threshold & p.y < threshold ~ "Both Sig",
+      p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+      p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+      TRUE ~ "Not Sig"
+    )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                    sprintf("%s Sig", label1), "Not Sig")))
+  
+  if(!is.null(highlight)) {
+    combined <- combined %>% dplyr::mutate(highlight = ifelse(Probe %in% highlight, TRUE, FALSE))
+  }
+  
+  max <- max(combined$logp.x, combined$logp.y, na.rm = TRUE)
+  min <- 0
+  
+  color_values <- c("black", "#BC3C29", "#0072B5", "#E18727")
+  color_values_names <- c("Not Sig", "Both Sig", sprintf("%s Sig", label2), sprintf("%s Sig", label1))
+  names(color_values) <- color_values_names
+  
+  if(highlight_sig) {
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y, color = Sig)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(Sig != "Not Sig"), alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      scale_color_manual(values = color_values) +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else if (!is.null(annotation)) {
+    combined <- combined %>%
+      dplyr::left_join(annotation, by = "Probe")
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y)) +
+      geom_point(data = combined %>% filter(is.na(Annotation)), alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(!is.na(Annotation)),
+                 aes(color = Annotation, shape = Annotation),
+                 alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else {
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+  }
+  
+  if(!is.null(highlight)) {
+    g <- g + geom_point(data = combined %>% dplyr::filter(highlight),
+                        size = point_size, color = "red", shape = 8)
+  }
+  
+  g
+}
+```
+
+
+```{r}
+compare_main_predictors_fine_tuned_cox_coxstratatt <- compare_pvals(
+  stats1 = results_cox_fine_tuned_main_predictors %>% mutate(Probe=indep),
+  stats2 = results_cox_fine_tuned_main_predictors_stratabatch_ttage_logmodel %>% mutate(Probe=indep),
+  label1 = "Main Cox model",
+  label2 =  "Cox model, strata Batch, tt Age",
+  point_size = point_size,
+  text_size = text_size-2
+)
+compare_main_predictors_fine_tuned_cox_coxstratatt
+```
+
+```{r}
+compare_wbc_core_model_cox_coxstratatt <- compare_pvals(
+  stats1 = results_cox_core_model_wbc %>% dplyr::mutate(Probe=indep),
+  stats2 = results_cox_core_model_wbc_stratabatch_ttage_logmodel %>% dplyr::mutate(Probe=indep),
+  label1 = "Main Cox model",
+  label2 =  "Cox model, strata Batch, tt Age",
+  point_size = point_size,
+  text_size = text_size-2,
+  threshold = threshold_predictors
+)  +
+  geom_label_repel(aes(label = Probe), size=1.5,fill="white")
+compare_wbc_core_model_cox_coxstratatt
+```
+
+#### Royston-Parmar models 
+
+```{r}
+compare_main_predictors_fine_tuned_cox_RP <- compare_pvals(
+  stats1 = results_cox_fine_tuned_main_predictors %>% mutate(Probe=indep),
+  stats2 = results_RP_fine_tuned_main_predictors %>% mutate(Probe=indep),
+  label1 = "Main Cox model",
+  label2 =  "Royston-Parmar model",
+  point_size = point_size,
+  text_size = text_size-2
+)
+compare_main_predictors_fine_tuned_cox_RP
+```
+
+```{r}
+compare_wbc_core_model_cox_RP <- compare_pvals(
+  stats1 = results_cox_core_model_wbc %>% dplyr::mutate(Probe=indep),
+  stats2 = results_RP_core_model_wbc %>% dplyr::mutate(Probe=indep),
+  label1 = "Main Cox model",
+  label2 =  "Royston-Parmar model",
+  point_size = point_size,
+  text_size = text_size-2,
+  threshold = threshold_predictors
+)  +
+  geom_label_repel(aes(label = Probe), fill="white", size=1.5)
+compare_wbc_core_model_cox_RP
+```
+
+#### adjust for C9 status
+
+```{r}
+compare_main_predictors_fine_tuned_cox_test_adjC9 <- compare_pvals(
+  stats1 = results_cox_fine_tuned_main_predictors_C9complete %>% dplyr::bind_rows(results_cox_fine_tuned_age) %>% mutate(Probe=indep),
+  stats2 = results_cox_fine_tuned_main_predictors_adjC9 %>%
+    dplyr::bind_rows(results_cox_fine_tuned_age_adjC9) %>% dplyr::mutate(Probe=indep),
+  label1 = "Main Cox model",
+  label2 =  "Cox model - adjusted for C9 status",
+  point_size = point_size,
+  text_size = text_size-2
+)
+compare_main_predictors_fine_tuned_cox_test_adjC9
+```
+
+```{r}
+compare_wbc_core_model_cox_test_adjC9 <- compare_pvals(
+  stats1 = results_cox_core_model_wbc_C9complete %>% dplyr::mutate(Probe=indep),
+  stats2 = results_cox_core_model_wbc_adjC9 %>% dplyr::mutate(Probe=indep),
+  label1 = "Main Cox model",
+  label2 =  "Cox model - adjusted for C9 status",
+  point_size = point_size,
+  text_size = text_size-2,
+  threshold = threshold_predictors
+)  +
+  geom_label_repel(aes(label = Probe), fill="white", size=1.5)
+compare_wbc_core_model_cox_test_adjC9
+```
