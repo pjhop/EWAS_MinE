@@ -1,0 +1,749 @@
+---
+title: "ewasdb_enrichments"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, warning=FALSE, message = FALSE, dev = "png")
+```
+
+## Libraries / data
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(stringi)
+library(bacon)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(ggpubr)
+library(GenomicRanges)
+library(network)
+library(ggnetwork)
+library(igraph)
+```
+
+```{r variables, include = FALSE, cache=FALSE}
+text_size=13
+point_size=2.5
+
+## Data
+load("prepared_data.rda")
+```
+
+## Functions
+
+```{r}
+calculate_enrichment <- function(sig_probes, all_probes, db, multiple_testing = FALSE) {
+  traits <- unique(db$Trait)
+  enrichments <- purrr::map_df(traits,
+                               sig_probes = sig_probes, 
+                               all_probes = all_probes,
+                               .f = calculate_enrichment_trait,
+                               db = db
+  )
+  enrichments %>% dplyr::arrange(p)
+}
+
+calculate_enrichment_trait <- function(trait, sig_probes, all_probes, db) {
+  trait_probes <- db %>% 
+    dplyr::filter(Trait == trait) %$% unique(CpG)
+  all_probes <- all_probes[!all_probes %in% sig_probes]
+  mat <- matrix(
+    c(sum(unique(sig_probes) %in% trait_probes),
+      sum(!unique(sig_probes) %in% trait_probes),
+      sum(unique(all_probes) %in% trait_probes),
+      sum(!unique(all_probes) %in% trait_probes)),
+    nrow = 2, byrow = TRUE
+  )
+  tst <- fisher.test(mat)
+  tibble(Trait = trait, 
+         n_sig_probes = dplyr::n_distinct(sig_probes),
+         perc_sig_probes = sum(unique(sig_probes) %in% trait_probes)/dplyr::n_distinct(sig_probes),
+         perc_bg_probes = sum(unique(all_probes) %in% trait_probes)/dplyr::n_distinct(all_probes),
+         n_trait_probes = length(trait_probes),
+         n_bg_probes = dplyr::n_distinct(all_probes),
+         OR = tst$estimate, 
+         conf.lower = tst$conf.int[1],
+         conf.upper = tst$conf.int[2],
+         p = tst$p.value
+  )
+}
+```
+
+
+## Load and filter databases
+
+```{r}
+## Load databases --------------------------------------------------------------
+ewas_db_mrc <- readr::read_tsv("data/external/EWAS_Catalog_03-07-2019.txt.gz")
+ewas_db_ngdc <- readr::read_tsv("data/external/ewasdb_ngdc_association_03042020.tsv")
+ewas_db_ngdc_cohorts <- readr::read_tsv("data/external/ewasdb_ngdc_cohort_03042020.tsv") 
+
+## NGDC ------------------------------------------------------------------------
+
+## Study ID + tissue 
+ewas_db_ngdc_cohorts_summarized <- ewas_db_ngdc_cohorts %>%
+  dplyr::select(study_ID, tissue) %>%
+  dplyr::group_by(study_ID) %>%
+  dplyr::filter(!duplicated(tissue))
+
+## Platform 
+ewas_db_ngdc_cohorts_summarized_platform <- ewas_db_ngdc_cohorts %>%
+  dplyr::select(study_ID, platform) %>%
+  dplyr::group_by(study_ID) %>%
+  dplyr::filter(!duplicated(platform))
+
+peripheral_blood_related_tissues_ngdc <- c(
+  "B-lymphocyte",
+  "blood",
+  "buffy coat",
+  "CD14+ monocyte",
+  "CD16+  neutrophil",
+  "CD19+ B cell",
+  "CD3+ T cell",
+  "CD4+ T cell",
+  "CD8+ T cell",
+  "leukocyte",
+  "lymphocyte",
+  "monocyte",
+  "neutrophil",
+  "peripheral blood",
+  "peripheral blood lymphocyte",
+  "peripheral blood mononuclear cell",
+  "T cell",
+  "T-lymphocyte",
+  "whole blood",
+  "granulocyte"
+)
+
+## Peripheral blood cohorts 
+ewas_db_ngdc_cohorts_peripheral_blood_related <- ewas_db_ngdc_cohorts_summarized %>%
+  dplyr::filter(tissue %in% peripheral_blood_related_tissues_ngdc)
+
+ewas_db_ngdc_blood <- ewas_db_ngdc %>%
+  dplyr::filter(study_ID %in% ewas_db_ngdc_cohorts_peripheral_blood_related$study_ID)
+
+## MRC 
+peripheral_blood_related_tissues <- c("B cells", "Blood", "CD14+ monocytes", "CD19+ B cells", "CD4+ T-cells",
+             "CD4+ T-cells and leukocytes", "CD4+ T-cells, leukocytes and whole blood",
+             "CD4+ T-cells, leukocytes and whole blood", "Leukocytes", 
+             "Leukocytes and CD4+ T cells", "Leukocytes, whole blood and CD4+ T cells", "Lymphocytes", "Monocytes", "Neutrophils", "Peripheral blood",
+             "Peripheral Blood", "Peripheral blood mononuclear cells", 
+             "White blood cells", "Whole blood", "Whole Blood", "Whole blood and CD4+ T cells",
+             "Whole blood and cord blood", "Whole blood, CD4+ T cells or monocytes", "T cells"
+             )
+
+ewas_db_mrc_blood <- ewas_db_mrc %>% 
+  dplyr::filter(Tissue %in% peripheral_blood_related_tissues)
+
+## Rename 
+ewas_db_ngdc <- ewas_db_ngdc %>% dplyr::rename(Trait = trait, CpG=probe_ID)
+ewas_db_ngdc_blood <- ewas_db_ngdc_blood %>% dplyr::rename(Trait = trait, CpG=probe_ID)
+```
+
+## Enrichment analyses
+
+```{r, eval=TRUE, warning = FALSE, message = FALSE}
+## LB NGDC 
+
+### Enrichment analysis
+sig_probes <- limma_tunedlambda1000_1.15_sig_filtered$Probe[limma_tunedlambda1000_1.15_sig_filtered$Probe %in% anno_450k$Name]
+db <- ewas_db_ngdc_blood %>% dplyr::filter(CpG %in% anno_450k$Name)
+n_trait_probes <- db %>%
+  dplyr::group_by(Trait) %>%
+  dplyr::summarize(n = n_distinct(CpG))
+n_trait_probes <- n_trait_probes %>% dplyr::filter(n >=5, n<=5000)
+all_probes <- intersect(intersect(limma_tunedlambda1000_1.15_filtered$Probe, anno_450k$Name), db$CpG)
+db <- db %>% dplyr::filter(Trait %in% n_trait_probes$Trait)
+
+enrichment_ngdc_limma_bgdb_5_5000 <- calculate_enrichment(
+  sig_probes = sig_probes,
+  all_probes = all_probes,
+  db = db
+)
+enrichment_ngdc_limma_bgdb_5_5000_sigfdr <- enrichment_ngdc_limma_bgdb_5_5000 %>%
+  dplyr::mutate(fdr = p.adjust(p, method = "fdr")) %>%
+  dplyr::filter(fdr < 0.05)
+
+
+### Iterative analysis
+lst <- list()
+lst2 <- list()
+i <- 1
+while(TRUE) {
+  print(paste0("Iteration: ", i))
+  enrichment <- calculate_enrichment(
+    sig_probes = sig_probes,
+    all_probes = all_probes,
+    db = db
+  )
+  enrichment$iteration <- i
+  if(i == 1) {
+    enrichment <- enrichment %>% 
+      dplyr::mutate(fdr = p.adjust(p, method = "fdr"))
+    enrichment_sig <- enrichment %>%
+      dplyr::filter(fdr < 0.05)
+  } else {
+    enrichment <- enrichment %>% 
+      dplyr::filter(Trait %in% lst[[sprintf("iteration%s", 1)]]$Trait)
+    enrichment_sig <- enrichment %>% dplyr::filter(p < 0.05, Trait %in% lst[[sprintf("iteration%s", i-1)]]$Trait)
+  }
+  
+  lst[[paste0("iteration", i)]] <- enrichment_sig
+  lst2[[paste0("iteration", i)]] <- enrichment
+  i <- i+1
+  if(nrow(enrichment_sig) > 1) {
+    enrichment_sig <- enrichment_sig %>% dplyr::filter(OR > 1)
+    trait <- enrichment_sig$Trait[1]
+    # Remove probes overlapping with the top trait
+    print(sprintf("Removing %s for iteration %s", trait, i))
+    trait_probes <- db %>% dplyr::filter(Trait == trait) %$% CpG
+    sig_probes <- sig_probes[!sig_probes %in% trait_probes]
+  } else {
+    break
+  }
+}
+enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000 <- lst
+enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_all <- lst2
+
+## LB MRC 
+
+### Enrichment analysis
+sig_probes <- limma_tunedlambda1000_1.15_sig_filtered$Probe[limma_tunedlambda1000_1.15_sig_filtered$Probe %in% anno_450k$Name]
+db <- ewas_db_mrc_blood %>% dplyr::filter(CpG %in% anno_450k$Name)
+n_trait_probes <- db %>%
+  dplyr::group_by(Trait) %>%
+  dplyr::summarize(n = n_distinct(CpG))
+n_trait_probes <- n_trait_probes %>% dplyr::filter(n >=5, n<=5000)
+all_probes <- intersect(intersect(limma_tunedlambda1000_1.15_filtered$Probe, anno_450k$Name), db$CpG)
+db <- db %>% dplyr::filter(Trait %in% n_trait_probes$Trait)
+
+enrichment_mrc_limma_bgdb_5_5000 <- calculate_enrichment(
+  sig_probes = sig_probes,
+  all_probes = all_probes,
+  db = db
+)
+enrichment_mrc_limma_bgdb_5_5000_sigfdr <- enrichment_mrc_limma_bgdb_5_5000 %>%
+  dplyr::mutate(fdr = p.adjust(p, method = "fdr")) %>%
+  dplyr::filter(fdr < 0.05)
+
+### Iterative analysis
+lst <- list()
+lst2 <- list()
+i <- 1
+while(TRUE) {
+  print(paste0("Iteration: ", i))
+  enrichment <- calculate_enrichment(
+    sig_probes = sig_probes,
+    all_probes = all_probes,
+    db = db
+  )
+  enrichment$iteration <- i
+  if(i == 1) {
+    enrichment <- enrichment %>% 
+      dplyr::mutate(fdr = p.adjust(p, method = "fdr"))
+    enrichment_sig <- enrichment %>%
+      dplyr::filter(fdr < 0.05)
+  } else {
+    enrichment <- enrichment %>% dplyr::filter(Trait %in% lst[[sprintf("iteration%s", 1)]]$Trait)
+    enrichment_sig <- enrichment %>% dplyr::filter(p < 0.05, Trait %in% lst[[sprintf("iteration%s", i-1)]]$Trait)
+  }
+  
+  lst[[paste0("iteration", i)]] <- enrichment_sig
+  lst2[[paste0("iteration", i)]] <- enrichment
+  i <- i+1
+  if(nrow(enrichment_sig) > 1) {
+    enrichment_sig <- enrichment_sig %>% dplyr::filter(OR > 1)
+    trait <- enrichment_sig$Trait[1]
+    # Remove probes overlapping with the top trait
+    print(sprintf("Removing %s for iteration %s", trait, i))
+    trait_probes <- db %>% dplyr::filter(Trait == trait) %$% CpG
+    sig_probes <- sig_probes[!sig_probes %in% trait_probes]
+  } else {
+    break
+  }
+}
+enrichment_mrc_limma_bgdb_fdr_iterated_5_5000 <- lst
+enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_all <- lst2
+
+## MOA NGDC 
+
+### Enrichment analysis
+sig_probes <- moa_sig_filtered$Probe[moa_sig_filtered$Probe %in% anno_450k$Name]
+db <- ewas_db_ngdc_blood %>% dplyr::filter(CpG %in% anno_450k$Name)
+n_trait_probes <- db %>%
+  dplyr::group_by(Trait) %>%
+  dplyr::summarize(n = n_distinct(CpG))
+n_trait_probes <- n_trait_probes %>% dplyr::filter(n >=5, n<=5000)
+all_probes <- intersect(intersect(moa_filtered$Probe, anno_450k$Name), db$CpG)
+db <- db %>% dplyr::filter(Trait %in% n_trait_probes$Trait)
+
+enrichment_ngdc_moa_bgdb_5_5000 <- calculate_enrichment(
+  sig_probes = sig_probes,
+  all_probes = all_probes,
+  db = db
+)
+enrichment_ngdc_moa_bgdb_5_5000_sigfdr <- enrichment_ngdc_moa_bgdb_5_5000 %>%
+  dplyr::mutate(fdr = p.adjust(p, method = "fdr")) %>%
+  dplyr::filter(fdr < 0.05)
+
+### Iterative analysis
+lst <- list()
+lst2 <- list()
+i <- 1
+while(TRUE) {
+  print(paste0("Iteration: ", i))
+  enrichment <- calculate_enrichment(
+    sig_probes = sig_probes,
+    all_probes = all_probes,
+    db = db
+  )
+  enrichment$iteration <- i
+  if(i == 1) {
+    enrichment <- enrichment %>% 
+      dplyr::mutate(fdr = p.adjust(p, method = "fdr"))
+    enrichment_sig <- enrichment %>%
+      dplyr::filter(fdr < 0.05)
+  } else {
+    enrichment <- enrichment %>% dplyr::filter(Trait %in% lst[[sprintf("iteration%s", 1)]]$Trait)
+    enrichment_sig <- enrichment %>% dplyr::filter(p < 0.05, Trait %in% lst[[sprintf("iteration%s", i-1)]]$Trait)
+  }
+  
+  lst[[paste0("iteration", i)]] <- enrichment_sig
+  lst2[[paste0("iteration", i)]] <- enrichment
+  i <- i+1
+  if(nrow(enrichment_sig) > 1) {
+    enrichment_sig <- enrichment_sig %>% dplyr::filter(OR > 1)
+    trait <- enrichment_sig$Trait[1]
+    # Remove probes overlapping with the top trait
+    print(sprintf("Removing %s for iteration %s", trait, i))
+    trait_probes <- db %>% dplyr::filter(Trait == trait) %$% CpG
+    sig_probes <- sig_probes[!sig_probes %in% trait_probes]
+  } else {
+    break
+  }
+}
+enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000 <- lst
+enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_all <- lst2
+
+## MOA MRC
+
+### Enrichment analysis
+sig_probes <- moa_sig_filtered$Probe[moa_sig_filtered$Probe %in% anno_450k$Name]
+db <- ewas_db_mrc_blood %>% dplyr::filter(CpG %in% anno_450k$Name)
+n_trait_probes <- db %>%
+  dplyr::group_by(Trait) %>%
+  dplyr::summarize(n = n_distinct(CpG))
+n_trait_probes <- n_trait_probes %>% dplyr::filter(n >=5, n<=5000)
+all_probes <- intersect(intersect(moa_filtered$Probe, anno_450k$Name), db$CpG)
+db <- db %>% dplyr::filter(Trait %in% n_trait_probes$Trait)
+
+enrichment_mrc_moa_bgdb_5_5000 <- calculate_enrichment(
+  sig_probes = sig_probes,
+  all_probes = all_probes,
+  db = db
+)
+enrichment_mrc_moa_bgdb_5_5000_sigfdr <- enrichment_mrc_moa_bgdb_5_5000 %>%
+  dplyr::mutate(fdr = p.adjust(p, method = "fdr")) %>%
+  dplyr::filter(fdr < 0.05)
+
+### Iterative analysis
+lst <- list()
+lst2 <- list()
+i <- 1
+while(TRUE) {
+  print(paste0("Iteration: ", i))
+  enrichment <- calculate_enrichment(
+    sig_probes = sig_probes,
+    all_probes = all_probes,
+    db = db
+  )
+  enrichment$iteration <- i
+  if(i == 1) {
+    enrichment <- enrichment %>% 
+      dplyr::mutate(fdr = p.adjust(p, method = "fdr"))
+    enrichment_sig <- enrichment %>%
+      dplyr::filter(fdr < 0.05)
+  } else {
+    enrichment <- enrichment %>% dplyr::filter(Trait %in% lst[[sprintf("iteration%s", 1)]]$Trait)
+    enrichment_sig <- enrichment %>% dplyr::filter(p < 0.05, Trait %in% lst[[sprintf("iteration%s", i-1)]]$Trait)
+  }
+  
+  lst[[paste0("iteration", i)]] <- enrichment_sig
+  lst2[[paste0("iteration", i)]] <- enrichment
+  i <- i+1
+  if(nrow(enrichment_sig) > 1) {
+    enrichment_sig <- enrichment_sig %>% dplyr::filter(OR > 1)
+    trait <- enrichment_sig$Trait[1]
+    # Remove probes overlapping with the top trait
+    print(sprintf("Removing %s for iteration %s", trait, i))
+    trait_probes <- db %>% dplyr::filter(Trait == trait) %$% CpG
+    sig_probes <- sig_probes[!sig_probes %in% trait_probes]
+  } else {
+    break
+  }
+}
+enrichment_mrc_moa_bgdb_fdr_iterated_5_5000 <- lst
+enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_all <- lst2
+```
+
+## Plots
+
+### LB NGDC
+
+#### Network
+
+```{r}
+enrichment_sig <- enrichment_ngdc_limma_bgdb_5_5000_sigfdr
+ewas_probes <- limma_tunedlambda1000_1.15_sig_filtered$Probe
+traits <- enrichment_sig$Trait
+
+## Empty matrix
+mtrx <- matrix(nrow = length(traits), ncol = length(traits))
+rownames(mtrx) <- traits
+colnames(mtrx) <- traits
+
+db <- ewas_db_ngdc_blood %>%
+  dplyr::filter(CpG %in% anno_450k$Name, Trait %in% traits, CpG %in% ewas_probes)
+
+for(trait in traits) {
+  db_probes <- db %>%
+    dplyr::filter(Trait == trait) %$% unique(CpG)
+  overview <- db %>%
+    dplyr::filter(CpG %in% db_probes) %>%
+    dplyr::group_by(Trait) %>%
+    dplyr::summarize(n = dplyr::n_distinct(CpG))
+  overview_ <- overview$n
+  names(overview_) <- overview$Trait
+  mtrx[trait, names(overview_)] <- overview_
+  mtrx[names(overview_), trait] <- overview_
+}
+mtrx[is.na(mtrx)] <- 0
+n <- network(mtrx, directed=FALSE, ignore.eval = FALSE, names.eval='weight')
+
+## Abrreviations
+dict <- c("HF", "ALRG", "MBT", "HDL", "WHR", "TG","IgE", "BMI", "CA", "BPB", "WC", "AC", "BW", "SCZ", "sBP", "HT", "dBP", "TG2", "GGT", "HOMA")
+names(dict) <- enrichment_sig$Trait
+
+## Plot 
+n %v% "logp" <- -log10(enrichment_sig[match(colnames(mtrx), enrichment_sig$Trait),]$p)
+n %v% "name" <- paste0(dict[enrichment_sig$Trait], "(n=", diag(mtrx), ")")
+n %v% "size" <- diag(mtrx)*100
+set.seed(10)
+network <- ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(aes(size=factor(weight))) +
+  geom_nodes(aes(color = logp, size=factor(size))) +
+  geom_nodelabel_repel(aes(label = name), size=3) +
+  # Work-around to get the sizes right
+  scale_size_manual(values = c("1" = 0.5, "2" = 1, "3" = 1.5,"100" = 2, "200" = 3, "300" = 4, "400" = 5, "500" = 6, "600" = 7, "700" = 8, "800" = 9, "900" = 10, "1000" = 11, "1100" = 12)
+  , name="overlap") +
+  theme_blank() +
+  labs(color="-log10(p)") +
+  guides(size=FALSE) 
+```
+
+```{r}
+dict_limma_ngdc_bgdb <- dict
+network_limma_ngdc_bgdb <- network
+network_limma_ngdc_bgdb
+```
+
+#### Iterative analysis
+
+```{r}
+enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged <- dplyr::bind_rows(enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000)
+enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged_all <- dplyr::bind_rows(enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_all)
+sig=unique(enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged$Trait)
+order <- enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged %>% dplyr::left_join(tibble(Trait = names(dict_limma_ngdc_bgdb), Trait2 = dict_limma_ngdc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>% dplyr::filter(iteration == 1) %>% dplyr::arrange(p) %$% Trait
+
+plot_enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged_all <- enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged_all %>%
+   dplyr::filter(Trait %in% sig) %>%
+   dplyr::left_join(tibble(Trait = names(dict_limma_ngdc_bgdb), Trait2 = dict_limma_ngdc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>%
+  dplyr::mutate(iteration = paste0("iteration", iteration)) %>%
+  dplyr::arrange(p) %>%
+  dplyr::mutate(Trait = factor(Trait, levels = order)) %>%
+  ggplot(aes(x = Trait, y = -log10(p))) +
+  geom_bar(stat = "identity", fill = "grey") +
+  theme_classic() +
+  theme(
+    text = element_text(size = text_size),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = text_size-7)
+  ) +
+  ylab(expression(-log[10](italic(p)))) +
+  xlab("") +
+  facet_wrap(~iteration, scales = "free_x", nrow=3)
+plot_enrichment_ngdc_limma_bgdb_fdr_iterated_5_5000_merged_all
+```
+
+### LB MRC
+
+#### Network
+
+```{r}
+enrichment_sig <- enrichment_mrc_limma_bgdb_5_5000_sigfdr
+ewas_probes <- limma_tunedlambda1000_1.15_sig_filtered$Probe
+traits <- enrichment_sig$Trait
+
+## Empty matrix
+mtrx <- matrix(nrow = length(traits), ncol = length(traits))
+rownames(mtrx) <- traits
+colnames(mtrx) <- traits
+
+db <- ewas_db_mrc_blood %>%
+  dplyr::filter(CpG %in% anno_450k$Name, Trait %in% traits, CpG %in% ewas_probes) 
+
+for(trait in traits) {
+  db_probes <- db %>%
+    dplyr::filter(Trait == trait) %$% unique(CpG)
+  overview <- db %>%
+    dplyr::filter(CpG %in% db_probes) %>%
+    dplyr::group_by(Trait) %>%
+    dplyr::summarize(n = dplyr::n_distinct(CpG))
+  overview_ <- overview$n
+  names(overview_) <- overview$Trait
+  mtrx[trait, names(overview_)] <- overview_
+  mtrx[names(overview_), trait] <- overview_
+}
+mtrx[is.na(mtrx)] <- 0
+n <- network(mtrx, directed=FALSE, ignore.eval = FALSE, names.eval='weight')
+
+# Abbreviations
+dict <- dict <- c("BMI", "IgE", "TG", "sTG", "WC", "HDL-c", "HW", "sHDL-c", "FG", "AF", "CRP", "BMIc", "PL", "GGT", "fINS", "AC", "2hINS", "ATP", "sIgE", "HOMA-IR", "pAN", "T2D", "CKD")
+names(dict) <- enrichment_sig$Trait
+
+n %v% "logp" <- -log10(enrichment_sig[match(colnames(mtrx), enrichment_sig$Trait),]$p)
+n %v% "name" <- paste0(dict[enrichment_sig$Trait], "(n=", diag(mtrx), ")")
+n %v% "size" <- diag(mtrx)*100
+set.seed(10)
+
+network <- ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(aes(size=factor(weight))) +
+  geom_nodes(aes(color = logp, size=factor(size))) +
+  geom_nodelabel_repel(aes(label = name), size=3) +
+  # Work-around to get the sizes right
+  scale_size_manual(values = c("1" = 0.5, "2" = 1, "3" = 1.5,"100" = 2, "200" = 3, "300" = 4, "400" = 5, "500" = 6, "600" = 7, "700" = 8, "800" = 9, "900" = 10, "1000" = 11, "1100" = 12)
+  , name="overlap") +
+  theme_blank() +
+  labs(color="-log10(p)") +
+  guides(size=FALSE) 
+```
+
+```{r}
+network_limma_mrc_bgdb <- network
+dict_limma_mrc_bgdb <- dict
+
+network_limma_mrc_bgdb
+```
+
+#### Iterative analysis
+
+```{r, fig.height=10}
+enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged <- dplyr::bind_rows(enrichment_mrc_limma_bgdb_fdr_iterated_5_5000)
+enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged_all <- dplyr::bind_rows(enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_all)
+sig=enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged$Trait
+order <- enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged %>% dplyr::left_join(tibble(Trait = names(dict_limma_mrc_bgdb), Trait2 = dict_limma_mrc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>% dplyr::filter(iteration == 1) %>% dplyr::arrange(p) %$% Trait
+
+plot_enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged_all <- enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged_all %>%
+  dplyr::filter(Trait %in% sig) %>%
+   dplyr::left_join(tibble(Trait = names(dict_limma_mrc_bgdb), Trait2 = dict_limma_mrc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>%
+  dplyr::mutate(iteration = paste0("iteration", iteration)) %>%
+  dplyr::arrange(p) %>%
+  dplyr::mutate(Trait = factor(Trait, levels = order)) %>%
+  ggplot(aes(x = Trait, y = -log10(p))) +
+  geom_bar(stat = "identity", fill = "grey") +
+  theme_classic() +
+  theme(
+    text = element_text(size = text_size),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = text_size-7)
+  ) +
+  ylab(expression(-log[10](italic(p)))) +
+  xlab("") +
+  facet_wrap(~iteration, scales = "free_x", nrow=3)
+plot_enrichment_mrc_limma_bgdb_fdr_iterated_5_5000_merged_all
+```
+
+### MOA NGDC
+
+#### Network
+
+```{r}
+enrichment_sig <- enrichment_ngdc_moa_bgdb_5_5000_sigfdr
+ewas_probes <- moa_sig_filtered$Probe
+traits <- enrichment_sig$Trait
+
+## Empty matrix
+mtrx <- matrix(nrow = length(traits), ncol = length(traits))
+rownames(mtrx) <- traits
+colnames(mtrx) <- traits
+
+db <- ewas_db_ngdc_blood %>%
+  dplyr::filter(CpG %in% anno_450k$Name, Trait %in% traits, CpG %in% ewas_probes) 
+
+for(trait in traits) {
+  db_probes <- db %>%
+    dplyr::filter(Trait == trait) %$% unique(CpG)
+  overview <- db %>%
+    dplyr::filter(CpG %in% db_probes) %>%
+    dplyr::group_by(Trait) %>%
+    dplyr::summarize(n = dplyr::n_distinct(CpG))
+  overview_ <- overview$n
+  names(overview_) <- overview$Trait
+  mtrx[trait, names(overview_)] <- overview_
+  mtrx[names(overview_), trait] <- overview_
+}
+mtrx[is.na(mtrx)] <- 0
+n <- network(mtrx, directed=FALSE, ignore.eval = FALSE, names.eval='weight')
+
+# Abbreviations
+dict <- c("HF","MBT", "HDL", "WHR", "WC", "TG", "BMI", "BW", "TG2","GGT", "HOMA", "INS", "WHtR", "AC")
+names(dict) <- enrichment_sig$Trait
+
+n %v% "logp" <- -log10(enrichment_sig[match(colnames(mtrx), enrichment_sig$Trait),]$p)
+n %v% "name" <- paste0(dict[enrichment_sig$Trait], "(n=", diag(mtrx), ")")
+n %v% "size" <- diag(mtrx)*100
+set.seed(10)
+
+network <- ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(aes(size=factor(weight))) +
+  geom_nodes(aes(color = logp, size=factor(size))) +
+  geom_nodelabel_repel(aes(label = name), size=3) +
+  # Work-around to get the sizes right
+  scale_size_manual(values = c("1" = 0.5, "2" = 1, "3" = 1.5,"100" = 2, "200" = 3, "300" = 4, "400" = 5, "500" = 6, "600" = 7, "700" = 8, "800" = 9, "900" = 10, "1000" = 11, "1100" = 12)
+  , name="overlap") +
+  theme_blank() +
+  labs(color="-log10(p)") +
+  guides(size=FALSE) 
+```
+
+```{r}
+network_moa_ngdc_bgdb <- network
+dict_moa_ngdc_bgdb <- dict
+network_moa_ngdc_bgdb
+```
+
+#### Iterative analysis 
+
+```{r, fig.height=10}
+enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged <- dplyr::bind_rows(enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000)
+enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged_all <- dplyr::bind_rows(enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_all)
+sig=enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged$Trait
+order <- enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged %>% dplyr::left_join(tibble(Trait = names(dict_moa_ngdc_bgdb), Trait2 = dict_moa_ngdc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>% dplyr::filter(iteration == 1) %>% dplyr::arrange(p) %$% Trait
+
+plot_enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged_all <- enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged_all %>%
+  dplyr::filter(Trait %in% sig) %>%
+   dplyr::left_join(tibble(Trait = names(dict_moa_ngdc_bgdb), Trait2 = dict_moa_ngdc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>%
+  dplyr::mutate(iteration = paste0("iteration", iteration)) %>%
+  dplyr::arrange(p) %>%
+  dplyr::mutate(Trait = factor(Trait, levels = order)) %>%
+  ggplot(aes(x = Trait, y = -log10(p))) +
+  geom_bar(stat = "identity", fill = "grey") +
+  theme_classic() +
+  theme(
+    text = element_text(size = text_size),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = text_size-7)
+  ) +
+  ylab(expression(-log[10](italic(p)))) +
+  xlab("") +
+  facet_wrap(~iteration, scales = "free_x", nrow=3)
+plot_enrichment_ngdc_moa_bgdb_fdr_iterated_5_5000_merged_all
+```
+
+
+### MOA MRC
+
+#### Network
+
+```{r}
+enrichment_sig <- enrichment_mrc_moa_bgdb_5_5000_sigfdr
+ewas_probes <- moa_sig_filtered$Probe
+traits <- enrichment_sig$Trait
+
+## Empty matrix
+mtrx <- matrix(nrow = length(traits), ncol = length(traits))
+rownames(mtrx) <- traits
+colnames(mtrx) <- traits
+
+db <- ewas_db_mrc_blood %>%
+  dplyr::filter(CpG %in% anno_450k$Name, Trait %in% traits, CpG %in% ewas_probes) 
+
+for(trait in traits) {
+  db_probes <- db %>%
+    dplyr::filter(Trait == trait) %$% unique(CpG)
+  overview <- db %>%
+    dplyr::filter(CpG %in% db_probes) %>%
+    dplyr::group_by(Trait) %>%
+    dplyr::summarize(n = dplyr::n_distinct(CpG))
+  overview_ <- overview$n
+  names(overview_) <- overview$Trait
+  mtrx[trait, names(overview_)] <- overview_
+  mtrx[names(overview_), trait] <- overview_
+}
+mtrx[is.na(mtrx)] <- 0
+n <- network(mtrx, directed=FALSE, ignore.eval = FALSE, names.eval='weight')
+
+# Abbreviations
+dict <- c("BMI", "TG", "sTG", "WC", "HDL-c", "HW", "sHDL-c", "FG", "AF", "BMIc", "PL", "GGT",
+          "fINS", "2hINS","HOMA-IR", "AC", "T2D", "CKD" ,"stCHOL", "MORT")
+names(dict) <- enrichment_sig$Trait
+
+n %v% "logp" <- -log10(enrichment_sig[match(colnames(mtrx), enrichment_sig$Trait),]$p)
+n %v% "name" <- paste0(dict[enrichment_sig$Trait], "(n=", diag(mtrx), ")")
+n %v% "size" <- diag(mtrx)*100
+set.seed(10)
+network <- ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(aes(size=factor(weight))) +
+  geom_nodes(aes(color = logp, size=factor(size))) +
+  geom_nodelabel_repel(aes(label = name), size=3) +
+  # Work-around to get the sizes right
+  scale_size_manual(values = c("1" = 0.5, "2" = 1, "3" = 1.5,"100" = 2, "200" = 3, "300" = 4, "400" = 5, "500" = 6, "600" = 7, "700" = 8, "800" = 9, "900" = 10, "1000" = 11, "1100" = 12), name="overlap") +
+  theme_blank() +
+  labs(color="-log10(p)") +
+  guides(size=FALSE) 
+```
+
+```{r}
+network_moa_mrc_bgdb <- network
+dict_moa_mrc_bgdb <- dict
+network_moa_mrc_bgdb
+```
+
+#### Iterative analyses
+
+```{r, fig.height=10}
+enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged <- dplyr::bind_rows(enrichment_mrc_moa_bgdb_fdr_iterated_5_5000)
+enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged_all <- dplyr::bind_rows(enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_all)
+sig=enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged$Trait
+order <- enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged %>% dplyr::left_join(tibble(Trait = names(dict_moa_mrc_bgdb), Trait2 = dict_moa_mrc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>% dplyr::filter(iteration == 1) %>% dplyr::arrange(p) %$% Trait
+
+
+plot_enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged_all <- enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged_all %>%
+  dplyr::filter(Trait %in% sig) %>%
+   dplyr::left_join(tibble(Trait = names(dict_moa_mrc_bgdb), Trait2 = dict_moa_mrc_bgdb), by = "Trait") %>%
+  dplyr::mutate(Trait = Trait2) %>%
+  dplyr::mutate(iteration = paste0("iteration", iteration)) %>%
+  dplyr::arrange(p) %>%
+  dplyr::mutate(Trait = factor(Trait, levels = order)) %>%
+  ggplot(aes(x = Trait, y = -log10(p))) +
+  geom_bar(stat = "identity", fill = "grey") +
+  theme_classic() +
+  theme(
+    text = element_text(size = text_size),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = text_size-7)
+  ) +
+  ylab(expression(-log[10](italic(p)))) +
+  xlab("") +
+  facet_wrap(~iteration, scales = "free_x", nrow=3)
+plot_enrichment_mrc_moa_bgdb_fdr_iterated_5_5000_merged_all
+```

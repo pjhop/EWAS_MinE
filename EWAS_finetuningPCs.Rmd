@@ -1,0 +1,489 @@
+---
+title: "fine_tuning_PCs"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, cache.lazy = FALSE, warning=FALSE, message = FALSE, dev = "png")
+```
+
+## Preliminaries
+
+```{r variables, include = FALSE, cache=FALSE}
+text_size=13
+point_size=2.5
+load("prepared_data.rda")
+```
+
+```{r packages, include=FALSE}
+library(tidyverse)
+library(magrittr)
+library(stringi)
+library(DT)
+library(ggbeeswarm)
+library(bacon)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+## Functions
+
+```{r functions}
+baconize <- function(stats, df, seed=10) {
+  set.seed(seed)
+  bc <- bacon(effectsizes = cbind(stats$b), standarderrors = cbind(stats$se))
+  stats$b <- round(drop(es(bc)), digits = 6)
+  stats$se <- round(drop(se(bc)), digits = 6)
+  stats$t <- drop(tstat(bc))
+  stats$p <- 2*pt(abs(stats$t), df = df, lower.tail = FALSE)
+  stats
+}
+
+load_osca <- function(path, threshold=NULL) {
+  ewas <- readr::read_tsv(path)
+  ewas <- ewas %>% 
+    dplyr::mutate(t = b / se) %>% # add t-statistic
+    dplyr::select(Chr, Probe, bp, b, se, p, t, Q.p, nr_samples) %>% # Remove some redundant info
+    dplyr::rename(NMISS = nr_samples)
+  
+  if(is.null(threshold)) {
+    ewas_sig <- ewas %>% dplyr::filter(p < 0.05/nrow(.))
+  } else {
+    ewas_sig <- ewas %>% dplyr::filter(p < threshold)
+  }
+  list(
+    all = ewas,
+    sig = ewas_sig
+  )
+}
+
+load_osca_individual_study <- function(path, threshold=NULL) {
+  ewas <- readr::read_tsv(path)
+  ewas <- ewas %>% 
+    dplyr::mutate(t = b / se) %>% # add t-statistic
+    dplyr::select(Chr, Probe, bp, b, se, p, t, NMISS) #Remove some redundant info
+
+  
+  if(is.null(threshold)) {
+    ewas_sig <- ewas %>% dplyr::filter(p < 0.05/nrow(.))
+  } else {
+    ewas_sig <- ewas %>% dplyr::filter(p < threshold)
+  }
+  list(
+    all = ewas,
+    sig = ewas_sig
+  )
+}
+
+gg_qqplot_multiple <- function(stats, group_var, show_lambda = TRUE, show_legend = TRUE, 
+                               cut = FALSE, threshold = NULL, ci = NULL, 
+                               plot_significance_line = FALSE,
+                               P_label = c("P", "Q.P"),
+                      text_size = 9, point_size = 1) {
+
+  # Quosure:
+  inflation <- stats %>%
+    dplyr::group_by(!!as.name(group_var)) %>%
+    dplyr::summarize(inflation = median(qchisq(1 - p,1))/qchisq(0.5,1))
+
+  stats <- stats %>%
+    dplyr::group_by(!!as.name(group_var)) %>%
+    dplyr::mutate(
+      observed = -log10(sort(p)),
+      expected = -log10(ppoints(n())),
+      clower   = if(!is.null(ci)) -log10(qbeta(p = (1 - ci) / 2, shape1 = 1:n(), shape2 = n():1)) else 0,
+      cupper   = if(!is.null(ci)) -log10(qbeta(p = (1 + ci) / 2, shape1 = 1:n(), shape2 = n():1)) else 0
+    )
+
+  P_label <- match.arg(P_label)
+  if(P_label == "P") {
+    log10Pe <- expression(paste("Expected -log"[10], plain(P)))
+    log10Po <- expression(paste("Observed -log"[10], plain(P)))
+  } else {
+    log10Pe <- expression(paste("Expected -log"[10], plain(Q.P)))
+    log10Po <- expression(paste("Observed -log"[10], plain(Q.P)))
+  }
+  
+
+  if(cut) {
+    if(is.null(threshold)) {
+      n <- stats %>%
+        dplyr::group_by(!!as.name(group_var)) %>%
+        dplyr::summarize(n = n())
+      n <- ceiling(mean(n$n))
+      threshold <- -log10(0.05 / n)
+    }
+    stats <- stats %>%
+      dplyr::mutate(observed = ifelse(observed > threshold, threshold, observed))
+  }
+
+  if(!is.null(ci)) {
+    g <- ggplot(stats, aes_string(x = "expected", y = "observed", color = group_var, shape = group_var)) +
+        geom_line(data = stats, aes(expected, cupper, color = NULL, shape = NULL), linetype = 2, alpha = 0.4) +
+        geom_line(data = stats, aes(expected, clower, color = NULL, shape = NULL), linetype = 2, alpha = 0.4) +
+        geom_abline(intercept = 0, slope = 1) +
+        geom_point(size = point_size, alpha = 0.8) +
+        xlab(log10Pe) +
+        ylab(log10Po) +
+        theme_classic()
+  } else {
+    g <- ggplot(stats, aes_string(x = "expected", y = "observed",
+                                  color = group_var, shape = group_var)) +
+      geom_abline(intercept = 0, slope = 1) +
+      geom_point(size = point_size, alpha = 0.8) +
+      xlab(log10Pe) +
+      ylab(log10Po) +
+      theme_classic() 
+  }
+  
+  if(!show_legend) {
+    g <- g + theme(text = element_text(size = text_size),
+                   legend.position = "none")
+  } else {
+    g <- g + theme(text = element_text(size = text_size), legend.position="bottom", legend.direction = "vertical"
+)
+  }
+
+  
+  if(show_lambda) {
+    labels <- inflation[[group_var]]
+    new <- c(sprintf("%s (\u03BB = %s)", inflation[[group_var]],
+                     round(inflation$inflation, 2)))
+    names(new) <- labels
+    g <- g + colorblindr::scale_colour_OkabeIto(labels = new) + scale_shape(guide = FALSE)
+  } else {
+    g <- g + colorblindr::scale_colour_OkabeIto()
+  }
+  
+  if(plot_significance_line) {
+    
+    if(is.null(threshold)) {
+      n <- stats %>%
+        dplyr::group_by(!!as.name(group_var)) %>%
+        dplyr::summarize(n = n())
+      n <- ceiling(mean(n$n))
+      threshold <- -log10(0.05 / n)
+    } else {
+        threshold <- -log10(threshold)
+    }
+    g <- g +
+      geom_hline(yintercept = threshold, linetype = "dashed", color = "red")
+  }
+ 
+  g
+}
+# https://gist.github.com/slowkow/9041570
+gg_qqplot <- function(pval, show_lambda = TRUE, cut = FALSE, threshold = NULL, ci = NULL,
+                      P_label = c("P", "Q.P"),
+                      text_size = 9, point_size = 1) {
+  n  <- length(pval)
+  chisq <- qchisq(1 - pval,1)
+  inflation <- median(chisq)/qchisq(0.5,1)
+  df <- tibble(
+    observed = -log10(sort(pval)),
+    expected = -log10(ppoints(n)),
+    clower   = if(!is.null(ci)) -log10(qbeta(p = (1 - ci) / 2, shape1 = 1:n, shape2 = n:1)) else 0,
+    cupper   = if(!is.null(ci)) -log10(qbeta(p = (1 + ci) / 2, shape1 = 1:n, shape2 = n:1)) else 0
+  )
+  P_label <- match.arg(P_label)
+  if(P_label == "P") {
+    log10Pe <- expression(paste("Expected -log"[10], plain(P)))
+    log10Po <- expression(paste("Observed -log"[10], plain(P)))
+  } else {
+    log10Pe <- expression(paste("Expected -log"[10], plain(Q.P)))
+    log10Po <- expression(paste("Observed -log"[10], plain(Q.P)))
+  }
+
+  if(cut) {
+    if(is.null(threshold)) {
+      threshold <- -log10(0.05 / length(pval))
+    }
+    df <- df %>%
+      dplyr::mutate(observed = ifelse(observed > threshold, threshold, observed))
+  }
+
+  g <-  ggplot(df) +
+    geom_point(aes(expected, observed), alpha= 0.8, size = point_size) +
+    geom_abline(intercept = 0, slope = 1, alpha = 0.5) +
+    xlab(log10Pe) +
+    ylab(log10Po) +
+    theme_classic() +
+    theme(text = element_text(size = text_size))
+  if(!is.null(ci)) {
+    g <- g +
+      geom_line(aes(expected, cupper), linetype = 2) +
+      geom_line(aes(expected, clower), linetype = 2)
+  }
+
+  if(show_lambda) {
+    label <- sprintf("paste(lambda, \" = \", %s)", round(inflation ,3))
+    g <- g + annotate("text", y = max(df$observed), x = 0.7,
+                      label = label, parse = TRUE, size = 0.31 * text_size)
+  }
+  g
+}
+
+load_individual_study <- function(path, threshold=NULL) {
+  ewas <- readr::read_tsv(path)
+  
+  if(is.null(threshold)) {
+    ewas_sig <- ewas %>% dplyr::filter(p < 0.05/nrow(.))
+  } else {
+    ewas_sig <- ewas %>% dplyr::filter(p < threshold)
+  }
+  list(
+    all = ewas,
+    sig = ewas_sig
+  )
+}
+
+baconize <- function(stats, df, seed=10) {
+  set.seed(seed)
+  bc <- bacon(effectsizes = cbind(stats$b), standarderrors = cbind(stats$se))
+  stats$b <- round(drop(es(bc)), digits = 6)
+  stats$se <- round(drop(se(bc)), digits = 6)
+  stats$t <- drop(tstat(bc))
+  stats$p <- 2*pt(abs(stats$t), df = df, lower.tail = FALSE)
+  stats
+}
+
+get_inflation <- function(p) {
+  chisq <- qchisq(1 - p,1)
+  inflation <- median(chisq)/qchisq(0.5,1)
+  inflation 
+}
+
+get_lambda_1000 <- function(lambda, case, control) {
+  lambda_1000 = 1+(lambda-1)*(1/case+1/control)/(1/1000+1/1000) 
+  lambda_1000
+}
+
+run_bacon <- function(npcs, limma, dfs, seed=10) {
+  df <- dfs %>% filter(nPCs == npcs)
+  baconize(limma[[npcs]][["all"]], df = df$df, seed = seed)
+}
+```
+
+## Get data and inflation factors
+```{r}
+nPCs <- seq(from = 5, to = 30, by = 5)
+
+## MinE 450k
+filenames <- sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs%sPCsres_missing0.05_stats.tsv",prefix, "mine_450k", nPCs)
+filenames <- c(sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_missing0.05_stats.tsv",prefix, "mine_450k"), filenames)
+limma_mine_450k <- purrr::map(filenames, .f = load_individual_study)
+names(limma_mine_450k) <- paste0("PC", c(0,nPCs))
+limma_mine_450k_bacon <- purrr::map(names(limma_mine_450k), 
+                                             .f = run_bacon, 
+                                             limma = limma_mine_450k,
+                                             dfs = df_mine_450k,
+                                             seed = 10
+                                             )
+names(limma_mine_450k_bacon) <- names(limma_mine_450k)
+
+
+## MinE EPIC
+filenames <- sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs%sPCsres_missing0.05_stats.tsv",prefix, "mine_epic", nPCs)
+filenames <- c(sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_missing0.05_stats.tsv",prefix, "mine_epic"), filenames)
+limma_mine_epic <- purrr::map(filenames, .f = load_individual_study)
+names(limma_mine_epic) <- paste0("PC", c(0,nPCs))
+limma_mine_epic_bacon <- purrr::map(names(limma_mine_epic), 
+                                             .f = run_bacon, 
+                                             limma = limma_mine_epic,
+                                             dfs = df_mine_epic,
+                                             seed = 10
+                                             )
+names(limma_mine_epic_bacon) <- names(limma_mine_epic)
+
+## AUS batch1
+filenames <- sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs%sPCsres_missing0.05_stats.tsv",prefix, "AUS_batch1", nPCs)
+filenames <- c(sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_missing0.05_stats.tsv",prefix, "AUS_batch1"), filenames)
+limma_AUS_batch1 <- purrr::map(filenames, .f = load_individual_study)
+names(limma_AUS_batch1) <- paste0("PC", c(0, nPCs))
+limma_AUS_batch1_bacon <- purrr::map(names(limma_AUS_batch1), 
+                                             .f = run_bacon, 
+                                             limma = limma_AUS_batch1,
+                                             dfs = df_AUS_batch1,
+                                             seed = 10
+                                             )
+names(limma_AUS_batch1_bacon) <- names(limma_AUS_batch1)
+
+
+## AUS batch2
+filenames <- sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs%sPCsres_missing0.05_stats.tsv",prefix, "AUS_batch2", nPCs)
+filenames <- c(sprintf("../all/output/limma/%s_%s_ewas_limma_covarsexbatch_qcovaragecellcounts30controlPCs_missing0.05_stats.tsv",prefix, "AUS_batch2"), filenames)
+
+limma_AUS_batch2 <- purrr::map(filenames, .f = load_individual_study)
+names(limma_AUS_batch2) <- paste0("PC", c(0,nPCs))
+limma_AUS_batch2_bacon <- purrr::map(names(limma_AUS_batch2), 
+                                             .f = run_bacon, 
+                                             limma = limma_AUS_batch2,
+                                             dfs = df_AUS_batch2,
+                                             seed = 10
+                                             )
+names(limma_AUS_batch2_bacon) <- names(limma_AUS_batch2)
+
+n_cases_controls <- samplesheet_merged %>%
+  dplyr::group_by(Study) %>%
+  dplyr::summarize(
+    ncases = sum(caseControl_bin == 1),
+    ncontrols = sum(caseControl_bin == 0)
+  )
+
+
+## Inflation factors
+inflation_mine_450k <- tibble(
+  Study = "mine_450k",
+  nPCs = c(0,nPCs),
+  lambda = purrr::map_dbl(limma_mine_450k, .f = function(x) get_inflation(x[["all"]]$p)),
+  lambda_1000 = purrr::map_dbl(lambda, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="mine_450k") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="mine_450k") %$% ncontrols),
+  lambda_bacon = purrr::map_dbl(limma_mine_450k_bacon, .f = function(x) get_inflation(x$p)),
+  lambda_bacon_1000 = purrr::map_dbl(lambda_bacon, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="mine_450k") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="mine_450k") %$% ncontrols)
+)
+
+
+
+inflation_mine_epic <- tibble(
+  Study = "mine_epic",
+  nPCs = c(0,nPCs),
+  lambda = purrr::map_dbl(limma_mine_epic, .f = function(x) get_inflation(x[["all"]]$p)),
+  lambda_1000 = purrr::map_dbl(lambda, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="mine_epic") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="mine_epic") %$% ncontrols),
+  lambda_bacon = purrr::map_dbl(limma_mine_epic_bacon, .f = function(x) get_inflation(x$p)),
+  lambda_bacon_1000 = purrr::map_dbl(lambda_bacon, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="mine_epic") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="mine_epic") %$% ncontrols)
+)
+
+
+inflation_AUS_batch1 <- tibble(
+  Study = "AUS_batch1",
+  nPCs = c(0,nPCs),
+  lambda = purrr::map_dbl(limma_AUS_batch1, .f = function(x) get_inflation(x[["all"]]$p)),
+  lambda_1000 = purrr::map_dbl(lambda, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="AUS_batch1") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="AUS_batch1") %$% ncontrols),
+  lambda_bacon = purrr::map_dbl(limma_AUS_batch1_bacon, .f = function(x) get_inflation(x$p)),
+  lambda_bacon_1000 = purrr::map_dbl(lambda_bacon, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="AUS_batch1") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="AUS_batch1") %$% ncontrols)
+)
+
+inflation_AUS_batch2 <- tibble(
+  Study = "AUS_batch2",
+  nPCs = c(0,nPCs),
+  lambda = purrr::map_dbl(limma_AUS_batch2, .f = function(x) get_inflation(x[["all"]]$p)),
+  lambda_1000 = purrr::map_dbl(lambda, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="AUS_batch2") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="AUS_batch2") %$% ncontrols),
+  lambda_bacon = purrr::map_dbl(limma_AUS_batch2_bacon, .f = function(x) get_inflation(x$p)),
+  lambda_bacon_1000 = purrr::map_dbl(lambda_bacon, .f = get_lambda_1000, case = n_cases_controls %>% dplyr::filter(Study=="AUS_batch2") %$% ncases, control = n_cases_controls %>% dplyr::filter(Study=="AUS_batch2") %$% ncontrols)
+)
+
+inflation_combined <- dplyr::bind_rows(
+  inflation_mine_450k,
+  inflation_mine_epic,
+  inflation_AUS_batch1,
+  inflation_AUS_batch2
+)
+```
+
+## Plots
+
+### Inflation factors per stratum and number of PCs
+
+#### lambda per stratum
+
+```{r}
+g <- ggplot(inflation_combined, aes(x = nPCs, lambda)) +
+  geom_point() +
+  geom_line() +
+  ggpubr::theme_pubclean() +
+  facet_wrap(~Study, scales = "free_y")
+g
+```
+
+#### lambda across studies
+
+```{r}
+g <- ggplot(inflation_combined, aes(x = nPCs, lambda, col = Study)) +
+  geom_point() +
+  geom_line() +
+  ggpubr::theme_pubclean() +
+  scale_y_continuous(breaks = seq(from=1, to=ceiling(max(inflation_combined$lambda)), by = .25)) +
+  colorblindr::scale_color_OkabeIto()
+g
+```
+
+#### lambda_1000 per stratum
+
+```{r}
+g <- ggplot(inflation_combined, aes(x = nPCs, lambda_1000)) +
+  geom_point() +
+  geom_line() +
+  ggpubr::theme_pubclean() +
+  facet_wrap(~Study, scales = "free_y")
+g
+```
+
+#### lambda_1000 across strata
+
+```{r}
+g <- ggplot(inflation_combined, aes(x = nPCs, lambda_1000, col = Study)) +
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(breaks = seq(from=1, to=ceiling(max(inflation_combined$lambda_1000)), by = .25)) +
+  ggpubr::theme_pubclean() +
+  colorblindr::scale_color_OkabeIto()
+g
+```
+#### lambda_1000 across strata - zoomed-in
+
+```{r}
+g <- ggplot(inflation_combined, aes(x = nPCs, lambda_1000, col = Study)) +
+  geom_point() +
+  geom_line() +
+  ggpubr::theme_pubclean() +
+  colorblindr::scale_color_OkabeIto()
+g + ggforce::facet_zoom(ylim = c(1, 1.3))
+```
+
+thresholds: 1.15, 1.20. 1.25
+
+```{r}
+g <- ggplot(inflation_combined, aes(x = nPCs, lambda_1000, col = Study)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept = 1.15, linetype = "dashed") +
+  geom_hline(yintercept = 1.2, linetype = "dashed") +
+  geom_hline(yintercept = 1.25, linetype = "dashed") +
+  ggpubr::theme_pubclean() +
+  colorblindr::scale_color_OkabeIto()
+g + ggforce::facet_zoom(ylim = c(1, 1.3))
+```
+
+
+### Meta-analysis qq-plots
+
+```{r}
+gg_qqplot_multiple(
+  dplyr::bind_rows(
+limma_tunedlambda1000_1.15_minPCs10 %>% mutate(Method = "max(\u03BB_1000) = 1.15"),
+limma_tunedlambda1000_1.2_minPCs10 %>% mutate(Method = "max(\u03BB_1000) = 1.20, min 10 PCs"),
+limma_tunedlambda1000_1.2_minPCs0 %>% mutate(Method = "max(\u03BB_1000) = 1.20, min 0 PCs"),
+limma_tunedlambda1000_1.25_minPCs10 %>% mutate(Method = "max(\u03BB_1000) = 1.25, min 10 PCs"),
+limma_tunedlambda1000_1.25_minPCs0 %>% mutate(Method = "max(\u03BB_1000) = 1.25, min 0 PCs")
+),
+group_var = "Method", show_lambda = TRUE, 
+cut = FALSE,
+plot_significance_line = TRUE, text_size = text_size, point_size=point_size)
+```
+
+capped p-values:
+
+```{r}
+gg_qqplot_multiple(
+  dplyr::bind_rows(
+limma_tunedlambda1000_1.15_minPCs10 %>% mutate(Method = "max(\u03BB_1000) = 1.15"),
+limma_tunedlambda1000_1.2_minPCs10 %>% mutate(Method = "max(\u03BB_1000) = 1.20, min 10 PCs"),
+limma_tunedlambda1000_1.2_minPCs0 %>% mutate(Method = "max(\u03BB_1000) = 1.20, min 0 PCs"),
+limma_tunedlambda1000_1.25_minPCs10 %>% mutate(Method = "max(\u03BB_1000) = 1.25, min 10 PCs"),
+limma_tunedlambda1000_1.25_minPCs0 %>% mutate(Method = "max(\u03BB_1000) = 1.25, min 0 PCs")
+),
+group_var = "Method", show_lambda = TRUE, 
+cut = TRUE,
+plot_significance_line = FALSE, text_size = text_size, point_size=point_size)
+```

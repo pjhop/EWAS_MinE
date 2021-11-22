@@ -1,0 +1,707 @@
+---
+title: "EWAS plots"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(stringi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(GenomicRanges)
+library(patchwork)
+library(ggforestplot)
+library(ggrepel)
+load("prepared_data.rda")
+```
+
+## Manhattans / volcanos / qqplots
+
+```{r}
+# based on: https://github.com/timknut/gg.manhattan/blob/master/gg.manhattan.R
+gg.manhattan <- function(stats, array = "450k", annotate_stats = NULL, threshold = NULL, sugg = NULL,
+                         hlight = NULL, annotate = FALSE,
+                         annotate_what = c("gene", "position"),
+                         annotate_table = NULL,
+                         annotate_table_how = c("text", "color"),
+                         annotate_label_or_text = c("label", "text"),
+                         title = NULL, col = NULL, ylims = NULL, text_size = 9, point_size = 1, label_size =1,
+                         segment.size =0.5, nudge_y = 0, nudge_x = 0, min.segment.length = 0.5, max_overlaps=20, max_time=5)
+ {
+  
+  annotate_label_or_text <- match.arg(annotate_label_or_text)
+  if(is.null(threshold)) {
+    threshold <- 0.05 / nrow(stats) # Use bonferroni by default
+  }
+  if(is.null(title)) {
+    title <- ""
+  }
+  if(is.null(ylims)) {
+    logp <- -log10(stats$p)
+    max_logp <- max(logp)
+    ylims <- c(0, max_logp + 0.15 * max_logp)
+  }
+  if(is.null(col)) {
+    col <- c("#4EAFAF", "#2C9696", "#0F8F8F", "#057272", "#005A5A") # 
+  }
+  
+  
+  # Add annotation
+  if(!is.null(annotate_stats)) {
+    ## Add annotation
+    stats <- stats[,!colnames(stats) %in% c("chr", "pos", "Name", "UCSC_RefGene_Name", "bp", "gene")]
+    stats <- stats %>% dplyr::left_join(annotate_stats[,c("chr", "pos", "Name", "UCSC_RefGene_Name")], by = c("Probe" = "Name"))
+    stats <- stats %>% dplyr::rename(bp = pos, gene = UCSC_RefGene_Name)
+  }
+  stats <- stats %>% dplyr::mutate(chr = as.numeric(stringr::str_replace(chr, "chr", "")))
+  # Update gene names
+  
+  stats.tmp <-  stats %>%
+    # Compute chromosome size
+    dplyr::group_by(chr) %>%
+    dplyr::summarise(chr_len=max(bp)) %>%
+    
+    # Calculate cumulative position of each chromosome
+    dplyr::mutate(tot = cumsum(as.numeric(chr_len)) - as.numeric(chr_len)) %>%
+    dplyr::select(-chr_len) %>%
+    
+    # Add this info to the initial dataset
+    dplyr::left_join(stats, ., by=c("chr")) %>%
+    
+    # Add a cumulative position of each SNP
+    dplyr::arrange(chr, bp) %>%
+    dplyr::mutate( bpcum = bp + tot)
+  
+  if(!is.null(hlight)) {
+    stats.tmp <- stats.tmp %>% dplyr::mutate(is_highlight = ifelse(Probe %in% hlight, TRUE, FALSE))
+  }
+  if(annotate | !is.null(annotate_table)) {
+    if(annotate) {
+      stats.tmp <- stats.tmp %>% dplyr::mutate(is_annotate = ifelse(p < threshold, TRUE, FALSE))
+    } else {
+      stats.tmp <- stats.tmp %>% dplyr::mutate(is_annotate = ifelse(Probe %in% annotate_table$Probe, TRUE, FALSE))
+    }
+  }
+  
+  
+  # get chromosome center positions for x-axis
+  axisdf <- stats.tmp %>% dplyr::group_by(chr) %>% dplyr::summarize(center=(max(bpcum) + min(bpcum) ) / 2 )
+  
+  g <- ggplot(stats.tmp, aes(x = bpcum, y = -log10(p))) +
+    # Show all points
+    geom_point(aes(color = as.factor(chr)), alpha= 0.8, size = point_size, show.legend=FALSE) +
+    scale_color_manual(values = rep(col, 22 )) +
+    
+    # custom X axis:
+    scale_x_continuous( label = axisdf$chr, breaks= axisdf$center ) +
+    scale_y_continuous(expand = c(0, 0), limits = ylims) + # expand=c(0,0)removes space between plot area and x axis
+    
+    # add plot and axis titles
+    ggtitle(paste0(title)) +
+    labs(x = "Chromosome", y = expression(-log[10](italic(p)))) +
+    
+    # add genome-wide sig and sugg lines
+    geom_hline(yintercept = -log10(threshold), linetype = "dashed") +
+    
+    # Custom the theme:
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      #     legend.position="none",
+      text = element_text(size = text_size),
+      axis.text.x = element_text(hjust = 1, angle = 90, size = (text_size - 3)),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+  
+  ## Options
+  if(!is.null(sugg)) {
+    g <- g + geom_hline(yintercept = -log10(sugg), linetype="dashed")
+  }
+  if(!is.null(hlight)) {
+    g <- g + geom_point(data = stats.tmp %>% dplyr::filter(is_highlight), color = "red", size = point_size, shape = 23, fill = "red")
+  }
+  
+  if(!is.null(annotate_table)) {
+    stats.tmp <- stats.tmp %>%
+      dplyr::left_join(annotate_table, by = "Probe")
+    
+    if(annotate_table_how == "text") {
+      if(!is.null(stats.tmp$col)) {
+        if(!is.null(stats.tmp$colors)) {
+          colors <- stats.tmp %>%
+            dplyr::filter(is_annotate) %>%
+            dplyr::group_by(col) %>%
+            dplyr::summarize(color = colors[1])
+          cols <- colors$color
+          names(cols) <- colors$col
+          
+          if(annotate_label_or_text == "label") {
+            g <- g +
+              geom_label_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                               aes(label = as.factor(Annotation), fill = col), size=label_size, show.legend=FALSE) +
+              geom_tile(data = stats.tmp %>% dplyr::filter(is_annotate), aes(fill = col), alpha = 0) + # workaround (https://stackoverflow.com/questions/54428683/geom-label-with-fill-aesthetic-remove-letter-in-legend)
+              guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+              scale_fill_manual(values = cols) +
+              theme(legend.title = element_blank())
+            
+          } else {
+            g <- g +
+              geom_text_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                              aes(label = as.factor(Annotation), color = col), size=label_size, show.legend=FALSE, segment.size = segment.size, nudge_x = nudge_x, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps=max_overlaps) +
+              geom_tile(data = stats.tmp %>% dplyr::filter(is_annotate), aes(fill = col), alpha = 0) + # workaround (https://stackoverflow.com/questions/54428683/geom-label-with-fill-aesthetic-remove-letter-in-legend)
+              guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+              scale_fill_manual(values = cols) +
+              theme(legend.title = element_blank())
+          }
+          
+          
+        } else {
+          if(annotate_label_or_text == "label") {
+            g <- g + geom_label_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                      aes(label = as.factor(Annotation), fill = col), size=label_size, show.legend=FALSE, segment.size = segment.size, nudge_x = nudge_y, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps) +
+              geom_tile(data = stats.tmp %>% dplyr::filter(is_annotate), aes(fill = col), alpha = 0) +
+              guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+              theme(legend.title = element_blank())
+          } else {
+            g <- g + geom_text_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                     aes(label = as.factor(Annotation), color = col), size=label_size, show.legend=FALSE,  segment.size = segment.size, nudge_x = nudge_y, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps) +
+              geom_tile(data = stats.tmp %>% dplyr::filter(is_annotate), aes(fill = col), alpha = 0) +
+              guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+              theme(legend.title = element_blank())
+          }
+        }
+      } else {
+        if(annotate_label_or_text == "label") {
+          g <- g + geom_label_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                    aes(label = as.factor(Annotation)), size=label_size, color = "black", fill = "white", segment.size = segment.size, nudge_x = nudge_y, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps)
+        } else {
+          g <- g + geom_text_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                   aes(label = as.factor(Annotation)), size=label_size, color = "black", fill = "white", segment.size = segment.size, nudge_x = nudge_x, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps)
+          
+        }
+      }
+      
+    } else {
+      g <- g + geom_point(data = stats.tmp %>% dplyr::filter(is_annotate),
+                          aes(col = Annotation)) +
+        colorblindr::scale_color_OkabeIto()
+    }
+    
+    
+  } else if(annotate) {
+    if(annotate_what == "position") {
+      if(annotate_label_or_text == "label") {
+        stats.tmp <- stats.tmp %>%
+          dplyr::mutate(chr_position = paste("chr", chr, bp, sep = ":"))
+        g <- g + geom_label_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                  aes(label = as.factor(chr_position)), size=label_size, color = "black", fill = "white", segment.size = segment.size, nudge_x = nudge_x, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps)
+      } else {
+        stats.tmp <- stats.tmp %>%
+          dplyr::mutate(chr_position = paste("chr", chr, bp, sep = ":"))
+        g <- g + geom_text_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                 aes(label = as.factor(chr_position)), size=label_size, color = "black", fill = "white", segment.size = segment.size, nudge_x = nudge_x, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps)
+      }
+      
+    } else {
+      if(annotate_label_or_text == "label") {
+        g <- g + geom_label_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                  aes(label = as.factor(gene)), size=label_size, color = "black",fill = "white", segment.size = segment.size, nudge_x = nudge_x, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps)
+      } else {
+        g <- g + geom_text_repel(data = stats.tmp %>% dplyr::filter(is_annotate),
+                                 aes(label = as.factor(gene)), size=label_size, color = "black",fill = "white", segment.size = segment.size, nudge_x = nudge_x, nudge_y = nudge_y, min.segment.length = min.segment.length, max.time = max_time, max.overlaps = max_overlaps)
+      }
+    }
+    
+  }
+  g
+}
+
+gg_qqplot2 <- function(pval, show_lambda = TRUE, cut = FALSE, threshold = NULL, ci = NULL,
+                       P_label = c("P", "Q.P"),
+                       text_size = 9, point_size = 1) {
+  n  <- length(pval)
+  chisq <- qchisq(1 - pval,1)
+  inflation <- median(chisq)/qchisq(0.5,1)
+  df <- tibble(
+    observed = -log10(sort(pval)),
+    expected = -log10(ppoints(n)),
+    clower   = if(!is.null(ci)) -log10(qbeta(p = (1 - ci) / 2, shape1 = 1:n, shape2 = n:1)) else 0,
+    cupper   = if(!is.null(ci)) -log10(qbeta(p = (1 + ci) / 2, shape1 = 1:n, shape2 = n:1)) else 0
+  )
+  P_label <- match.arg(P_label)
+  if(P_label == "P") {
+    log10Pe <- expression(paste("Expected -log"[10], (italic(p))))
+    log10Po <- expression(paste("Observed -log"[10], (italic(p))))
+  } else {
+    log10Pe <- expression(paste("Expected -log"[10], plain(Q.P)))
+    log10Po <- expression(paste("Observed -log"[10], plain(Q.P)))
+  }
+  
+  if(cut) {
+    if(is.null(threshold)) {
+      threshold <- -log10(0.05 / length(pval))
+    }
+    df <- df %>%
+      dplyr::mutate(observed = ifelse(observed > threshold, threshold, observed))
+  }
+  
+  g <-  ggplot(df) +
+    geom_point(aes(expected, observed), alpha= 0.8, size = point_size) +
+    geom_abline(intercept = 0, slope = 1, alpha = 0.5) +
+    xlab(log10Pe) +
+    ylab(log10Po) +
+    theme_classic() +
+    theme(text = element_text(size = text_size))
+  if(!is.null(ci)) {
+    g <- g +
+      geom_line(aes(expected, cupper), linetype = 2) +
+      geom_line(aes(expected, clower), linetype = 2)
+  }
+  
+  if(show_lambda) {
+    label <- sprintf("paste(lambda, \" = \", %s)", round(inflation ,3))
+    g <- g + annotate("text", y = max(df$observed), x = 0.7,
+                      label = label, parse = TRUE, size = 0.31 * text_size)
+  }
+  g
+}
+
+
+set.seed(10)
+text_size <- 9
+point_size <- 1
+label_size <- 1.75
+nudge_x = 0
+nudge_y = 0.9
+min.segment.length = 0.01
+segment.size = 0.1
+geom_pointrange_size <- 0.3
+geom_pointrange_fatten <- 0.15
+
+## Manhattans + qq-plots
+annot <- anno %>%
+  dplyr::filter(Name %in% moa_sig_filtered$Probe) %>%
+  dplyr::select(Probe = Name, Annotation = Gene)
+
+manhattan_moa <- gg.manhattan(moa_filtered,
+                   annotate_stats = anno,
+                   threshold = threshold,
+                   annotate_table = annot,
+                   annotate_table_how = "text",
+                   col = c("#5D82BB", "#3B64A5", "#1E4F9E", "#103B7E", "#082B64"),
+                   text_size = text_size,
+                   point_size = point_size,
+                   label_size = label_size,
+                   annotate_label_or_text = "text",
+                   nudge_x = nudge_x,
+                   nudge_y = nudge_y,
+                   min.segment.length = min.segment.length,
+                   segment.size = segment.size)
+
+annot <- anno %>%
+  dplyr::filter(Name %in% limma_tunedlambda1000_1.15_sig_filtered$Probe) %>%
+  dplyr::select(Probe = Name, Annotation = Gene)
+
+manhattan_LB <- gg.manhattan(limma_tunedlambda1000_1.15_filtered %>% dplyr::arrange(p),
+                   annotate_stats = anno,
+                   threshold = threshold,
+                   annotate_table = annot,
+                   annotate_table_how = "text",
+                   col = c("#5D82BB", "#3B64A5", "#1E4F9E", "#103B7E", "#082B64"),
+                   text_size = text_size,
+                   point_size = point_size,
+                   label_size = 1.60,
+                   annotate_label_or_text = "text",
+                   nudge_x = 0.9,
+                   nudge_y = 1,
+                   min.segment.length = min.segment.length,
+                   segment.size = segment.size)
+
+qqplot_moa <- gg_qqplot2(moa_filtered$p, show_lambda = TRUE, text_size = text_size, point_size=point_size)
+
+qqplot_LB <- gg_qqplot2(limma_tunedlambda1000_1.15_filtered$p, show_lambda = TRUE, text_size = text_size, point_size=point_size)
+
+
+text_size <- 7
+label_size <- 1.75
+point_size=0.5
+nudge_x = 0
+nudge_y = 0
+color_volcano = "black"
+alpha_volcano = 0.5
+color_volcano_point_range = "sienna2"
+
+annot <- anno %>%
+  dplyr::filter(Name %in% limma_tunedlambda1000_1.15_sig_filtered$Probe) %>%
+  dplyr::select(Probe = Name, Annotation = Gene) 
+
+volcano_LB <- limma_tunedlambda1000_1.15_filtered %>% 
+  dplyr::mutate(
+    sig = ifelse(p < 9e-8, TRUE, FALSE)
+  ) %>%
+  dplyr::filter(!Probe %in% limma_tunedlambda1000_1.15_sig_filtered$Probe) %>%
+  ggplot(aes(x = b, y = -log10(p),colour = sig)) +
+  geom_vline(xintercept=0,linetype="dashed") +
+  geom_point(size=point_size,color=color_volcano, alpha = alpha_volcano) + 
+  geom_pointrange(data=limma_tunedlambda1000_1.15_sig_filtered, aes(xmin = lower.fixed, xmax = upper.fixed, y = -log10(p), fill=NULL, colour = NULL), colour = color_volcano_point_range, size=geom_pointrange_size, fatten=geom_pointrange_fatten) +
+  scale_color_manual(values=c("black", "red"), name="Significant") + 
+  geom_text_repel(data = limma_tunedlambda1000_1.15_sig_filtered %>%
+                    dplyr::arrange(p) %>% 
+                    head(10) %>%
+                    dplyr::mutate(
+                      sig = ifelse(p < 9e-8, TRUE, FALSE)
+                    ) %>%
+                    dplyr::left_join(annot, by = "Probe"),
+                  aes(label = Annotation), 
+                  size=label_size, color = "black",fill = "white", force_pull=0.5, segment.size = segment.size, nudge_x = nudge_y, nudge_y = nudge_y, min.segment.length = min.segment.length) +
+  theme_classic() +
+  xlab('Estimate') + 
+  ylab(expression(-log[10](italic(p)))) + 
+  theme(axis.text = element_text(size = text_size),
+        axis.title = element_text(size = text_size), 
+        legend.title = element_blank()) +
+  theme(legend.position='none') 
+
+annot <- anno %>%
+  dplyr::filter(Name %in% moa_sig_filtered$Probe) %>%
+  dplyr::select(Probe = Name, Annotation = Gene) 
+
+volcano_moa <- moa_filtered %>% 
+  dplyr::mutate(
+    sig = ifelse(p < 9e-8, TRUE, FALSE)
+  ) %>%
+  dplyr::filter(!Probe %in% moa_sig_filtered$Probe) %>%
+  ggplot(aes(x = b, y = -log10(p),colour = sig)) +
+  geom_vline(xintercept=0,linetype="dashed") +
+  geom_point(size=point_size,color=color_volcano, alpha = alpha_volcano) + 
+  scale_color_manual(values=c("black", "red"), name="Significant") + 
+  geom_text_repel(data = moa_sig_filtered %>%
+                    dplyr::mutate(
+                      sig = ifelse(p < 9e-8, TRUE, FALSE)
+                    ) %>%
+                    dplyr::left_join(annot, by = "Probe"),
+                  aes(label = Annotation), 
+                  size=label_size, color = "black",fill = "white", segment.size = segment.size, nudge_x = nudge_y, nudge_y = nudge_y, min.segment.length = min.segment.length) +
+  geom_pointrange(data=moa_sig_filtered, aes(xmin = lower.fixed, xmax = upper.fixed, y = -log10(p), fill=NULL, colour = NULL), colour = color_volcano_point_range,  size=geom_pointrange_size, fatten=geom_pointrange_fatten) +
+  theme_classic() +
+  xlab('Estimate') + 
+  ylab(expression(-log[10](italic(p)))) + 
+  theme(axis.text = element_text(size = text_size),
+        axis.title = element_text(size = text_size), 
+        legend.title = element_blank()) +
+  theme(legend.position='none') 
+
+
+combined <- ((manhattan_LB + volcano_LB + plot_layout(ncol =2, widths = c(4,3))) / (manhattan_moa + volcano_moa + plot_layout(ncol =2, widths = c(4,3))) / (qqplot_LB + qqplot_moa)) + plot_annotation(tag_levels = 'A', ) & theme(plot.tag = element_text(face = 'bold', size = 13)) 
+combined
+```
+
+## Heterogeneity
+
+```{r}
+compare_pvals_heterogeneity <- function(stats, highlight = NULL, 
+                                        threshold = NULL, 
+                                        text_size = 9, 
+                                        point_size = 1, 
+                                        show_legend = TRUE,
+                                        annotation = NULL, 
+                                        col = NULL, 
+                                        col_which = 2, 
+                                        plot_threshold = FALSE) {
+  
+  # Add logp
+  stats <- stats %>% dplyr::mutate(logp = -log10(p), 
+                                   t = b / se,
+                                   logQp = -log10(Q.p))
+
+  
+  # Add logp
+  if(is.null(threshold)) {
+    threshold <- 0.05 / nrow(stats)
+  }
+  
+  if(!is.null(highlight)) {
+    combined <- stats %>% dplyr::mutate(highlight = ifelse(Probe %in% highlight, TRUE, FALSE))
+  } else {
+    combined <- stats
+  }
+  
+  max <- max(combined$logp, combined$logQp, na.rm = TRUE)
+  min <- 0
+  
+ if (!is.null(annotation)) {
+    combined <- combined %>%
+      dplyr::left_join(annotation, by = "Probe")
+    g <- ggplot(combined, aes_string(x = "logp",
+                                     y = "logQp", color = col)) +
+      geom_point(data = combined %>% filter(is.na(Annotation)), alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(!is.na(Annotation)),
+                 aes(color = Annotation, shape = Annotation),
+                 alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P))),
+           y = bquote(-log[10](italic(Q.P)))) +
+      colorblindr::scale_color_OkabeIto() +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else {
+    g <- ggplot(combined, aes_string(x = "logp",
+                                     y = "logQp")) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P))),
+           y = bquote(-log[10](italic(Q.P)))) +
+      theme_classic() +
+      colorblindr::scale_color_OkabeIto() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+  }
+  
+  if(!is.null(highlight)) {
+    g <- g + geom_point(data = combined %>% dplyr::filter(highlight),
+                        size = point_size, color = "red", shape = 8)
+  }
+  
+  if(plot_threshold) {
+    g <- g +
+      geom_hline(yintercept = -log10(threshold), linetype = "dashed") +
+      geom_vline(xintercept = -log10(threshold), linetype = "dashed")
+  }
+  
+  g
+}
+```
+
+### MOA
+
+```{r}
+compare_pvals_heterogeneity(
+  stats = moa_filtered,threshold = threshold, highlight = moa_sig_filtered$Probe, text_size = text_size, point_size = point_size)
+```
+
+
+### LB
+
+```{r}
+compare_pvals_heterogeneity(
+  stats = limma_tunedlambda1000_1.15_filtered,threshold = threshold, highlight = limma_tunedlambda1000_1.15_sig_filtered$Probe, text_size = text_size, point_size = point_size)
+```
+
+
+## Compare LB / MOA 
+
+```{r}
+compare_pvals <- function(stats1, stats2, label1, label2, highlight = NULL, highlight_sig = TRUE,
+                          threshold = NULL, text_size = 9, point_size = 1, show_legend = TRUE,
+                          annotation = NULL) {
+  
+  # Add logp
+  stats1 <- stats1 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+  stats2 <- stats2 %>% dplyr::mutate(logp = -log10(p), t = b / se)
+
+  # Add logp
+  if(is.null(threshold)) {
+    threshold <- 0.05 / nrow(stats1)
+  }
+  
+  combined <- stats1[,c("Probe", "p", "b", "t", "logp")] %>%
+    dplyr::left_join(stats2[,c("Probe","p", "b", "t", "logp")], by = "Probe") %>%
+    dplyr::mutate(Sig = dplyr::case_when(
+      p.x < threshold & p.y < threshold ~ "Both Sig",
+      p.x > threshold & p.y < threshold ~ sprintf("%s Sig", label2),
+      p.x < threshold & p.y > threshold ~ sprintf("%s Sig", label1),
+      TRUE ~ "Not Sig"
+    )) %>% dplyr::mutate(Sig = factor(Sig, levels=c("Both Sig", sprintf("%s Sig", label2),
+                                                    sprintf("%s Sig", label1), "Not Sig")))
+  
+  if(!is.null(highlight)) {
+    combined <- combined %>% dplyr::mutate(highlight = ifelse(Probe %in% highlight, TRUE, FALSE))
+  }
+  
+  max <- max(combined$logp.x, combined$logp.y, na.rm = TRUE)
+  min <- 0
+  
+  color_values <- c("black", "#BC3C29", "#0072B5", "#E18727")
+  color_values_names <- c("Not Sig", "Both Sig", sprintf("%s Sig", label2), sprintf("%s Sig", label1))
+  names(color_values) <- color_values_names
+  
+  if(highlight_sig) {
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y, color = Sig)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(Sig != "Not Sig"), alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      scale_color_manual(values = color_values) +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else if (!is.null(annotation)) {
+    combined <- combined %>%
+      dplyr::left_join(annotation, by = "Probe")
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y)) +
+      geom_point(data = combined %>% filter(is.na(Annotation)), alpha= 0.8, size = point_size) +
+      geom_point(data = combined %>% filter(!is.na(Annotation)),
+                 aes(color = Annotation, shape = Annotation),
+                 alpha = 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+    
+  } else {
+    g <- ggplot(combined, aes(x = logp.x,
+                              y = logp.y)) +
+      geom_point(alpha= 0.8, size = point_size) +
+      geom_abline(slope = 1, linetype = "dashed") +
+      labs(x = bquote(-log[10](italic(P)) ~ .(label1)),
+           y = bquote(-log[10](italic(P)) ~ .(label2))) +
+      theme_classic() +
+      xlim(min, max + 0.1*abs(max)) +
+      ylim(min, max + 0.1*abs(max)) +
+      theme(text = element_text(size=text_size),
+            legend.position = if(show_legend) "right" else "none") +
+      coord_fixed()
+  }
+  
+  if(!is.null(highlight)) {
+    g <- g + geom_point(data = combined %>% dplyr::filter(highlight),
+                        size = point_size, color = "red", shape = 8)
+  }
+  g
+}
+```
+
+
+```{r}
+compare_pvals(
+  stats1 = moa_filtered,
+  stats2 = limma_tunedlambda1000_1.15_filtered,
+  label1 = " - MOA",
+  label2 = " - linear+bacon (tuned 1.15)",
+  text_size = text_size,
+  point_size = point_size,
+  threshold = threshold
+)
+```
+
+## Forest plots
+
+#### LB
+
+```{r}
+order <- limma_tunedlambda1000_1.15_sig_filtered %>% 
+  dplyr::left_join(anno[,c("Name", "Gene")],by=c("Probe"="Name")) %>%
+  dplyr::mutate(Probe = paste(Probe, Gene, sep=";")) %>% dplyr::arrange(p) %$% Probe
+order <- tibble(Probe=order)
+
+dat <- 
+  order %>% dplyr::left_join(
+    (limma_tunedlambda1000_1.15_all_studies %>%
+  dplyr::select(-Gene) %>%
+  dplyr::left_join(anno[,c("Name", "Gene")],by=c("Probe"="Name")) %>%
+  dplyr::mutate(Probe = paste(Probe, Gene, sep=";")) %>%
+  dplyr::arrange(desc(p))),by="Probe"
+  ) %>%
+  dplyr::rename(Stratum = Study) %>%
+  dplyr::mutate(Stratum = dplyr::case_when(
+    Stratum == "mine_450k" ~ "MinE 450k",
+    Stratum == "mine_epic" ~ "MinE EPIC",
+    Stratum == "AUS_batch1" ~ "AUS1",
+    Stratum == "AUS_batch2" ~ "AUS2",
+    TRUE ~ Stratum
+  )) %>%
+  dplyr::mutate(Stratum = factor(Stratum, levels = rev(c("MinE 450k","MinE EPIC", "AUS1", "AUS2", "meta-analysis"))))
+
+forest_plot_LB <- forestplot(
+  df = dat,
+  name = Probe,
+  estimate = b,
+  se = se,
+  logodds = FALSE,
+  colour = Stratum,
+  shape = Stratum,
+  title = "",
+  xlab = "Estimate",
+  xtickbreaks = c(-0.02, -0.015, -0.01,-0.005, 0, 0.005, 0.01, 0.015, 0.02)
+) + scale_color_manual(values = c("AUS1" = "#E69F00", "AUS2" = "#56B4E9",
+                                  "MinE 450k" = "#009E73", "MinE EPIC" = "#F0E442", "meta-analysis" = "black"))  +
+  ggplot2::scale_shape_manual(
+    values = c("meta-analysis" = 23L,"AUS1"= 21L, "AUS2"= 21L,"MinE 450k"=21L, "MinE EPIC"=21L)
+  )+
+  theme(text = element_text(size=10)) 
+  
+forest_plot_LB
+```
+
+
+#### MOA
+
+```{r}
+order <- moa_sig_filtered %>% dplyr::left_join(anno[,c("Name", "Gene")],by=c("Probe"="Name")) %>%
+  dplyr::mutate(Probe = paste(Probe, Gene, sep=";")) %>% dplyr::arrange(p) %$% Probe
+order <- tibble(Probe=order)
+
+dat <-
+  order %>% dplyr::left_join(
+    (moa_all_combined %>%
+  dplyr::left_join(anno[,c("Name", "Gene")],by=c("Probe"="Name")) %>%
+  dplyr::mutate(Probe = paste(Probe, Gene, sep=";")) %>%
+  dplyr::arrange(desc(p))),by="Probe"
+  ) %>%
+  dplyr::rename(Stratum = Study) %>%
+  dplyr::mutate(Stratum = dplyr::case_when(
+    Stratum == "mine_450k" ~ "MinE 450k",
+    Stratum == "mine_epic" ~ "MinE EPIC",
+    Stratum == "AUS_batch1" ~ "AUS1",
+    Stratum == "AUS_batch2" ~ "AUS2",
+    TRUE ~ Stratum
+  )) %>%
+  dplyr::mutate(Stratum = factor(Stratum, levels = rev(c("MinE 450k","MinE EPIC", "AUS1", "AUS2", "meta-analysis"))))
+
+forest_plot_moa <- forestplot(
+  df = dat,
+  name = Probe,
+  estimate = b,
+  se = se,
+  logodds = FALSE,
+  colour = Stratum,
+  shape = Stratum,
+  title = "",
+  xlab = "Estimate",
+  xtickbreaks = c(-5, -4,-3, -2,-1, 0, 1, 2, 3, 4,5),
+  size=40
+) + scale_color_manual(values = c("AUS1" = "#E69F00", "AUS2" = "#56B4E9",
+                                  "MinE 450k" = "#009E73", "MinE EPIC" = "#F0E442", "meta-analysis" = "black"))  +
+  ggplot2::scale_shape_manual(
+    values = c("meta-analysis" = 23L,"AUS1"= 21L, "AUS2"= 21L,"MinE 450k"=21L, "MinE EPIC"=21L)
+  ) +
+  theme(text = element_text(size=10))
+  
+forest_plot_moa
+```
