@@ -230,4 +230,4 @@ saveRDS(out_royston_epic, file="final_models/royston_parmar_test_epic_hazard.rds
 ```
 
 
-#did not add meta.. and only main cox with coxph..the rest is only small adjustments?
+output was meta analysed using metal
